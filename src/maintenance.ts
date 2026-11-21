@@ -89,7 +89,6 @@ async function judgeNote(options: Options, id: string, attempt: 1 | 2, retryDeci
 
 export async function maintain(options: Options): Promise<MaintenanceResult> {
   const { kind, scopes, automatic, full, store, settings, progress, signal, onFailure } = options;
-  if (kind === "consolidate") await store.prepareConsolidation(signal);
   const result = { changes: 0, skipped: 0 };
   for (const scope of scopes) {
     signal?.throwIfAborted();

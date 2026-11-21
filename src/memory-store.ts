@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { RecordId, type Surreal } from "surrealdb";
 import { DEFAULT_DATABASE_PATH, withDatabase } from "./database.ts";
 import { commands } from "./commands.ts";
+import { freshSchema, migrateSchema, type SchemaMigrationObserver } from "./schema-migrations.ts";
 
 export const memoryKinds = ["guideline", "preference", "note"] as const;
 export type Scope = "project" | "global";
@@ -88,6 +89,7 @@ export class MemoryStore {
         if (existing.model !== space.model || existing.dimensions !== space.dimensions) {
           throw new Error("Smart Mem is already initialized with a different embedding model or dimension");
         }
+        await migrateSchema(db, undefined, signal);
         return;
       }
       signal?.throwIfAborted();
@@ -105,7 +107,6 @@ export class MemoryStore {
         DEFINE FIELD embedding ON memory TYPE option<array<float>>;
         DEFINE FIELD embedding_alt ON memory TYPE option<array<float>>;
         DEFINE FIELD reviewed ON memory TYPE bool DEFAULT false;
-        DEFINE FIELD consolidated ON memory TYPE option<bool>;
         DEFINE TABLE memory_incident SCHEMALESS;
         DEFINE TABLE smart_pin SCHEMALESS;
         DEFINE TABLE smart_skill SCHEMALESS;
@@ -118,13 +119,18 @@ export class MemoryStore {
         DEFINE TABLE memory_link SCHEMAFULL TYPE RELATION IN memory OUT memory ENFORCED;
         DEFINE INDEX memory_link_pair ON memory_link FIELDS in, out UNIQUE;
         CREATE ONLY mem_config:embedding CONTENT $space;
+        ${freshSchema}
         COMMIT TRANSACTION;
       `, { space });
     }, signal);
   }
 
-  async embeddingSpace(): Promise<EmbeddingSpace | undefined> {
-    return this.#use(async (db) => (await db.query<[EmbeddingSpace | undefined]>(selectSpace))[0]);
+  async embeddingSpace(upgrade?: { observe: SchemaMigrationObserver; signal?: AbortSignal }): Promise<EmbeddingSpace | undefined> {
+    return this.#use(async (db) => {
+      const [space] = await db.query<[EmbeddingSpace | undefined]>(selectSpace);
+      if (space && upgrade) await migrateSchema(db, upgrade.observe, upgrade.signal);
+      return space;
+    }, upgrade?.signal);
   }
 
   async inventory(): Promise<ScopedInventory> {
@@ -388,11 +394,6 @@ export class MemoryStore {
     const pending = selection === "unconsolidated" ? " AND consolidated != true" : selection ? " AND reviewed = false" : "";
     const [rows] = await this.#use((db) => db.query<[StoredMemory[]]>(`SELECT ${projection} FROM memory WHERE ${filter}${pending} ORDER BY id`, this.#bind({})).collect());
     return rows.map(memory);
-  }
-
-  async prepareConsolidation(signal?: AbortSignal): Promise<void> {
-    // Profiles initialized before incremental consolidation do not have this optional field.
-    await this.#use((db) => db.query("DEFINE FIELD IF NOT EXISTS consolidated ON memory TYPE option<bool>").collect(), signal);
   }
 
   async markConsolidated(note: Memory, checked: boolean, signal?: AbortSignal): Promise<void> {

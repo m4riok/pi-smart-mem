@@ -143,6 +143,39 @@ test("unconfigured startup warns without opening the picker; setup command asks 
   assert.deepEqual(errors, []);
 });
 
+test("startup displays and logs database upgrades, and blocks unsupported schemas", async (t) => {
+  let render;
+  const frames = [];
+  const { session, note, store, directory, faux, errors } = await fixture(t, { mode: "tui", setWidget: (_key, build) => {
+    render = undefined;
+    const widget = build?.({ requestRender: () => { if (render) frames.push(render()); } }, { fg: (_color, text) => text });
+    if (widget) render = () => widget.render(180).join("\n");
+  } });
+  const path = join(directory, "db");
+  const query = (sql) => withDatabase(path, false, (db) => db.query(sql).collect());
+  await query("REMOVE TABLE smart_schema; REMOVE FIELD consolidated ON memory;");
+  await session.reload();
+  assert.ok(frames.some((frame) => frame.includes("Schema 0 → 1")), JSON.stringify(frames));
+  assert.match(render(), /Smart Mem database upgraded to schema 1/);
+  assert.deepEqual(await store.read(note.id), note);
+  await session.reload();
+  assert.doesNotMatch(render(), /database upgraded/);
+  const log = async () => (await readFile(join(directory, "smart-mem.log"), "utf8")).trim().split("\n").map(JSON.parse);
+  assert.deepEqual((await log()).filter(({ event }) => event.startsWith("schema.migration.")).map(({ event, from, to }) => ({ event, from, to })), [
+    { event: "schema.migration.start", from: 0, to: 1 },
+    { event: "schema.migration.applied", from: 0, to: 1 },
+  ]);
+  await query("UPDATE smart_schema:current SET version = 2;");
+  await session.reload();
+  assert.match(render(), /^🧠 ····  Not set up/);
+  assert.match(render(), /schema 2 is newer than supported schema 1/);
+  assert.ok((await log()).some(({ event, error }) => event === "schema.open_failed" && error.includes("schema 2")));
+  await session.prompt("/psm-consolidate global");
+  assert.equal(faux.state.callCount, 0);
+  assert.deepEqual(await store.read(note.id), note);
+  assert.deepEqual(errors, []);
+});
+
 test("Smart Mem and Hermes tool names coexist in one Pi session", async (t) => {
   const { session, alerts, errors } = await fixture(t, { hermes: true });
   assert.ok(!alerts.some(([message]) => message.includes("/psm-setup")));
@@ -531,8 +564,6 @@ test("incremental consolidation tracks checked text, retains older candidates, a
   const project = new MemoryStore(await resolveProject(cwd, path), path);
   const { model, dimensions } = models[0];
   const vector = { model, values: [1, ...Array(dimensions - 1).fill(0)] };
-  // Exercise a configured profile from before the consolidation field existed.
-  await withDatabase(path, false, (db) => db.query("REMOVE FIELD consolidated ON memory").collect());
   const old = await project.add({ scope: "project", kind: "note", text: "Older project note" }, vector);
   const global = await store.add({ scope: "global", kind: "note", text: "Global note" }, vector);
   const command = session.extensionRunner.getRegisteredCommands().find(({ name }) => name === "psm-consolidate");

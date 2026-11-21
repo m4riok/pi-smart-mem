@@ -145,9 +145,33 @@ export default function smartMemory(pi: ExtensionAPI): void {
     if (!match) throw new Error(`Unsupported Smart Mem embedding model: ${model}`);
     return match;
   }
-  async function readActivePreset() {
-    const space = await stat(dbPath).then((info) => info.isDirectory(), isMissing) ? await store.embeddingSpace() : undefined;
+  async function readActivePreset(upgrade?: Parameters<MemoryStore["embeddingSpace"]>[0]) {
+    const space = await stat(dbPath).then((info) => info.isDirectory(), isMissing) ? await store.embeddingSpace(upgrade) : undefined;
     return space && preset(space.model);
+  }
+
+  async function openActivePreset(ctx: ExtensionContext, signal?: AbortSignal) {
+    let activity: Activity | undefined;
+    let applied: number | undefined;
+    let pending: { from: number; to: number } | undefined;
+    try {
+      const model = await readActivePreset({ signal, observe: (stage, from, to) => {
+        void log.write(`schema.migration.${stage}`, { from, to });
+        if (stage === "applied") { applied = to; pending = undefined; return; }
+        pending = { from, to };
+        activity ??= begin(ctx, "Upgrading Smart Mem database");
+        activity?.update(`Schema ${from} → ${to}`);
+      } });
+      if (applied !== undefined) {
+        const message = `Smart Mem database upgraded to schema ${applied}`;
+        if (activity) activity.finish(message);
+        else if (ctx.hasUI) notify(ctx, message);
+      }
+      return model;
+    } catch (error) {
+      await log.write(pending ? "schema.migration.failed" : "schema.open_failed", { ...pending, error: String(error) }, "error");
+      throw error;
+    } finally { activity?.clear(); }
   }
 
   async function embed(text: string, query = false, signal?: AbortSignal) {
@@ -185,7 +209,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
     const title = rebuild ? "Rebuilding Smart Mem index" : "Setting up Smart Mem";
     const run = (report: Progress, signal: AbortSignal) => embeddings.run(async (worker) => {
       void log.write("setup.start", { model: next.model, rebuild });
-      if ((await readActivePreset())?.model !== current?.model) throw new Error("Smart Mem model changed in another session. Reopen setup and retry.");
+      if ((await openActivePreset(ctx, signal))?.model !== current?.model) throw new Error("Smart Mem model changed in another session. Reopen setup and retry.");
       const device = embeddingDevice(next, (await file.read()).device);
       const space = { model: next.model, dimensions: next.dimensions };
       report("Loading embedding model");
@@ -210,7 +234,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
   }
 
   async function setup(ctx: ExtensionCommandContext) {
-    const current = await readActivePreset();
+    const current = await openActivePreset(ctx);
     return runManualJob(ctx, ctx.mode === "tui" && !current, async (signal) => {
       const setup = await prepareSetup(ctx, current, signal);
       return setup && { kind: "setup", ...setup };
@@ -220,7 +244,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
   async function setDevice(ctx: ExtensionContext, device: Device) {
     await embeddings.run(async (worker) => {
       if ((await file.read()).device === device) return;
-      const model = await readActivePreset();
+      const model = await openActivePreset(ctx);
       if (!model) throw new Error("Set up Smart Mem before changing device");
       await progress(ctx, `Testing ${device.toUpperCase()}`, async () => {
         await worker.embed(model, device, "Test embedding device");
@@ -353,9 +377,11 @@ export default function smartMemory(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     activeContext = ctx;
-    try { activePreset = await readActivePreset(); }
-    catch (error) { await log.write("session.start_failed", { error: String(error) }, "error"); throw error; }
-    if (hasPanel(ctx)) panel.mount(ctx.ui, !!activePreset);
+    activePreset = undefined;
+    if (hasPanel(ctx)) panel.mount(ctx.ui, false);
+    try { activePreset = await openActivePreset(ctx); }
+    catch (error) { reportError(ctx, error); return; }
+    panel.setActive(!!activePreset);
     if (activePreset) {
       await bindProject(ctx);
       await refreshCounts(ctx);
@@ -559,7 +585,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
         const sourceForSetup = !activePreset ? await readSource() : undefined;
         const needsSetup = !activePreset && ctx.hasUI;
         if (needsSetup && background) await ctx.waitForIdle();
-        const firstSetup = needsSetup ? await prepareSetup(ctx, await readActivePreset(), signal) : undefined;
+        const firstSetup = needsSetup ? await prepareSetup(ctx, await openActivePreset(ctx, signal), signal) : undefined;
         if (!firstSetup) getStore();
         const title = "Migrating Hermes";
         return {

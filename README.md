@@ -80,6 +80,10 @@ Close other Pi sessions using Hermes or Smart Mem, then run `/psm-migrate-hermes
 
 `/psm-migrate-hermes force` runs in the foreground and **replaces existing Smart Mem data**, including memories, links, skills, pins, and the transcript index. Without `force`, migration refuses to replace a populated store. Neither form deletes Pi transcripts; use Smart Mem's transcript backfill to rebuild the index.
 
+## Database upgrades
+
+Smart Mem upgrades an existing database when Pi starts, using a versioned schema under the database lock. It reports progress and outcomes in the status panel and `smart-mem.log`. Fresh setup creates the current schema directly. The consolidation upgrade preserves existing notes, embeddings, and any previous check markers; no Hermes re-import is needed. If an upgrade fails or the database version is newer than supported, Smart Mem stays unavailable and reports the error.
+
 ## Project identity
 
 Smart Mem looks up Git `origin` locally and uses `.pi/smart-mem-id` when the origin is missing or new. It creates the marker in the main checkout, or in the working folder outside Git. Keep the marker when moving or renaming a project. Worktrees, clones with the same origin, and copies carrying the same marker share memories, skills, and pins within the same Smart Mem database. If origin and marker point to different known projects, Smart Mem reports the conflict and leaves both unchanged.

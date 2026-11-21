@@ -26,6 +26,39 @@ async function fixture(t) {
   return { path, store, other: new MemoryStore("/repo/b", path), global: new MemoryStore(undefined, path) };
 }
 
+test("concurrent opens upgrade an unversioned store once without clearing check markers", async (t) => {
+  const { path, store, global } = await fixture(t);
+  const queryDb = (sql) => withDatabase(path, false, (db) => db.query(sql).collect());
+  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [1]);
+  const note = await global.add(preference("A checked legacy note"), query);
+  await global.markConsolidated(note, true);
+  await queryDb("REMOVE TABLE smart_schema;");
+  const transitions = [];
+  const open = (store) => store.embeddingSpace({ observe: (...event) => transitions.push(event) });
+  assert.deepEqual(await Promise.all([open(store), open(global)]), [space, space]);
+  assert.deepEqual(transitions, [["start", 0, 1], ["applied", 0, 1]]);
+  assert.deepEqual(await global.read(note.id), note);
+  assert.deepEqual(await global.list("global", "unconsolidated"), []);
+  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [1]);
+});
+
+test("a failed schema upgrade rolls back its field and version together", async (t) => {
+  const { path, store } = await fixture(t);
+  const queryDb = (sql) => withDatabase(path, false, (db) => db.query(sql).collect());
+  await queryDb(`REMOVE TABLE smart_schema; REMOVE FIELD consolidated ON memory;
+    DEFINE TABLE smart_schema SCHEMAFULL;
+    DEFINE FIELD version ON smart_schema TYPE int ASSERT $value = 0;`);
+  const events = [];
+  await assert.rejects(store.embeddingSpace({ observe: (...event) => events.push(event) }), /database migration 0 → 1 failed/);
+  assert.deepEqual(events, [["start", 0, 1]]);
+  const [schema, version] = await queryDb("INFO FOR TABLE memory; SELECT VALUE version FROM ONLY smart_schema:current;");
+  assert.ok(!Object.hasOwn(schema.fields, "consolidated"));
+  assert.equal(version, undefined);
+  await queryDb("REMOVE FIELD version ON smart_schema;");
+  assert.deepEqual(await store.embeddingSpace({ observe: (...event) => events.push(event) }), space);
+  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [1]);
+});
+
 test("explicit initialization and durable scoped CRUD", async (t) => {
   const { path, store, other, global } = await fixture(t);
   assert.ok((await stat(path)).isDirectory());
