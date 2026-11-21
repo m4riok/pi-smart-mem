@@ -26,7 +26,7 @@ Pi searches the current project and global notes by default. It can narrow searc
 
 ## When Pi saves memories
 
-Pi can save a note during normal work. Say **"remember this"** to ask it to consider saving something; that request does not guarantee a new entry. Before saving, the model is prompted to check standing guidance and search for similar notes **in the same scope**. It should skip what's already covered, update a note when the rule changes, or add a genuinely distinct note. This is model judgment, not a guarantee against duplicates. A review can increase an existing memory's weight by one when original session evidence confirms a new correction or recurrence, including an independently verified finding. Reusing the same evidence does not increase weight again. Weight does not change recall ranking.
+Pi can save a note during normal work. Say **"remember this"** to ask it to consider saving something; that request does not guarantee a new entry. Before saving, the model is prompted to check standing guidance and search for similar notes **in the same scope**. It should skip what's already covered, update a note when the rule changes, or add a genuinely distinct note. This is model judgment, not a guarantee against duplicates. A review can increase an existing memory's weight by one when original session evidence confirms a new correction or recurrence, including an independently verified finding. The reviewer cites the original message, so echoes do not invalidate its evidence. Reusing that evidence or repeating the same report verbatim in the session does not increase weight again. A rejected evidence citation is a skip, not a review failure. Weight does not change recall ranking.
 
 Automatic memory review runs in the main Pi session:
 

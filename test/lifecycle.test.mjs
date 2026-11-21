@@ -686,6 +686,25 @@ test("consolidation retries a prose decision once, then skips unanswered notes a
   assert.deepEqual(errors, []);
 });
 
+test("the next Smart Mem command clears a stale panel error even without a new result", async (t) => {
+  let widget;
+  const render = () => widget.render(140).join("\n");
+  const settingsFrames = [];
+  const { session, errors } = await fixture(t, {
+    mode: "tui",
+    setWidget: (_key, build) => { widget = build?.({ requestRender() {} }, { fg: (_color, text) => text }); },
+    custom: async () => { settingsFrames.push(render()); },
+  });
+  await session.prompt("/psm-consolidate gobal");
+  assert.match(render(), /Smart Mem: Error: Use \/psm-consolidate \[global\] \[full\]/);
+  await session.prompt("/psm-settings");
+  assert.equal(settingsFrames.length, 1);
+  assert.doesNotMatch(settingsFrames[0], /Use \/psm-consolidate|Alt\+U details/);
+  assert.doesNotMatch(render(), /Use \/psm-consolidate|Alt\+U details/);
+  assert.match(render(), /Active/);
+  assert.deepEqual(errors, []);
+});
+
 test("Debug logging is opt-in and records untruncated consolidation input, replies and tool calls", async (t) => {
   let toggle;
   const { session, store, directory, faux, errors } = await fixture(t, { select: async (title, options) => {
@@ -797,26 +816,81 @@ test("manual linking, reclassification, and both cleanup passes trace decisions 
   assert.deepEqual(errors, []);
 });
 
-test("review boosts once per incident, including independently verified evidence", async (t) => {
-  const { session, faux, note, store, errors, directory } = await fixture(t);
-  await new SettingsFile(directory).update({ initialMessages: 100 });
+const evidenceIds = (messages, role, quote) => messages.filter((message) => message.role === role && contentText(message.content).includes(quote))
+  .map((message) => contentText(message.content).match(/\[Smart Mem evidence messageId: ([^\]]+)\]/)?.[1]);
+
+test("review boosts original evidence despite a tool echo and counts repeated reports once", async (t) => {
+  const { session, faux, note, store, errors, directory, sessionManager } = await fixture(t);
+  await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
   const correction = "No, use the exit status for this failed setup check.";
   const evidence = "I reproduced a second bug: the suite failed with exit status 2 but its wrapper reported success.";
-  const boost = (evidence) => fauxToolCall("psm_reinforce_memory", { id: note.id, evidence });
+  const { model, dimensions } = models[0];
+  const echo = await store.add({ scope: "global", kind: "note", text: correction }, { model, values: Array.from({ length: dimensions }, (_, i) => Number(i === 0)) });
+  const boost = (messageId, evidence) => fauxToolCall("psm_reinforce_memory", { id: note.id, messageId, evidence });
+  let originalId, echoId, repeatedId, distinctId;
   faux.setResponses([
     ({ messages }) => {
       assert.ok(!getCurrentTools(messages).some(({ name }) => name === "psm_reinforce_memory"));
-      return fauxAssistantMessage("I'll check the exit status.");
+      assert.deepEqual(evidenceIds(messages, "user", correction), [undefined]);
+      return fauxAssistantMessage(fauxToolCall("psm_memory_read", { id: echo.id }));
     },
-    fauxAssistantMessage(boost(correction)), fauxAssistantMessage("Reinforced after a fresh correction."),
-    fauxAssistantMessage(evidence), fauxAssistantMessage("The checks are complete."),
-    fauxAssistantMessage([boost(correction), boost(evidence)]), fauxAssistantMessage("Only the newly verified incident counted."),
+    ({ messages }) => {
+      [originalId] = evidenceIds(messages, "user", correction);
+      [echoId] = evidenceIds(messages, "toolResult", correction);
+      return fauxAssistantMessage(boost(originalId, correction));
+    },
+    fauxAssistantMessage("Reinforced after a fresh correction."),
+    fauxAssistantMessage("I checked the exit status."),
+    fauxAssistantMessage("That's the same setup check."),
+    ({ messages }) => {
+      repeatedId = evidenceIds(messages, "user", correction).at(-1);
+      return fauxAssistantMessage(boost(repeatedId, correction));
+    },
+    fauxAssistantMessage("This report already counted."),
+    fauxAssistantMessage(evidence),
+    ({ messages }) => {
+      [distinctId] = evidenceIds(messages, "assistant", evidence);
+      return fauxAssistantMessage([boost(originalId, correction), boost(distinctId, evidence)]);
+    },
+    fauxAssistantMessage("Only the newly verified incident counted."),
   ]);
   await session.prompt(correction);
+  assert.ok(originalId && echoId && originalId !== echoId);
   assert.deepEqual(await store.read(note.id), { ...note, weight: 1 });
-  await session.prompt("Check the other test wrapper.");
-  await session.prompt("Show the status.");
+  await session.prompt(correction);
+  assert.ok(repeatedId && repeatedId !== originalId);
+  assert.deepEqual(await store.read(note.id), { ...note, weight: 1 });
+  await session.prompt("No, check the other test wrapper too.");
+  assert.ok(distinctId && distinctId !== originalId);
   assert.deepEqual(await store.read(note.id), { ...note, weight: 2 });
+  assert.deepEqual(rows(sessionManager).map(({ status }) => status), ["Saved · 1", "Skipped", "Saved · 1"]);
+  assert.deepEqual(errors, []);
+});
+
+test("a rejected reinforcement citation skips review without marking a tool failure", async (t) => {
+  const { session, faux, note, store, sessionManager, errors } = await fixture(t);
+  const correction = "No, check the actual exit status.";
+  faux.setResponses([
+    fauxAssistantMessage("Checking."),
+    ({ messages }) => {
+      const [messageId] = evidenceIds(messages, "user", correction);
+      return fauxAssistantMessage([
+        fauxToolCall("psm_reinforce_memory", { id: note.id, messageId, evidence: "This quote isn't in the cited message." }),
+        fauxToolCall("psm_reinforce_memory", { id: note.id, messageId: "not-active", evidence: correction }),
+      ]);
+    },
+    fauxAssistantMessage("No valid evidence citation."),
+  ]);
+  await session.prompt(correction);
+  assert.deepEqual(await store.read(note.id), note);
+  const [review] = rows(sessionManager);
+  assert.equal(review.status, "Skipped");
+  assert.equal(review.saved, 0);
+  assert.equal(review.calls.length, 2);
+  for (const call of review.calls) {
+    assert.equal(call.isError, false);
+    assert.deepEqual(call.result, { saved: false, result: { reinforced: false, reason: "Evidence must quote the cited active session message verbatim" } });
+  }
   assert.deepEqual(errors, []);
 });
 

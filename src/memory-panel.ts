@@ -66,6 +66,12 @@ export class MemoryPanel {
     this.#tui?.requestRender();
   }
 
+  clearError() {
+    if (this.#latest?.level !== "error") return;
+    this.#clearNotice();
+    this.#tui?.requestRender();
+  }
+
   #clearNotice() {
     clearTimeout(this.#noticeTimer);
     this.#noticeTimer = undefined;

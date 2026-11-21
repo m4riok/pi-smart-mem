@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { convertToLlm, getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -19,6 +18,7 @@ import { MemoryStore, type Scope } from "./src/memory-store.ts";
 import { lookupNames, memoryTools, operation, registerTools, toolNames } from "./src/memory-tools.ts";
 import { resolveProject } from "./src/project.ts";
 import { detectTrigger, injectionText, newReport, reviewTask, reviewTitle, runModel, type RunReport, type Trigger, type UserTrigger } from "./src/review.ts";
+import { reviewEvidence } from "./src/review-evidence.ts";
 import { chooseEmbeddingModel, openSettings, prompt, SettingsFile, type Settings } from "./src/settings.ts";
 import { SharedEmbeddings } from "./src/shared-embeddings.ts";
 
@@ -87,6 +87,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
   const embeddings = new SharedEmbeddings(directory, log);
   const registerCommand: ExtensionAPI["registerCommand"] = (name, options) => pi.registerCommand(name, {
     ...options, handler: async (args, ctx) => {
+      if (hasPanel(ctx)) panel.clearError();
       void log.write("command.start", { name });
       await options.handler(args, ctx);
     },
@@ -301,29 +302,20 @@ export default function smartMemory(pi: ExtensionAPI): void {
     const loop = previous.then(async () => {
       signal?.throwIfAborted();
       const available = reviewTools.filter(({ name }) => settings.reviewTools.includes(name));
-      const reinforce = settings.reviewTools.includes(toolNames.reinforceMemory);
-      if (reinforce) {
+      const evidence = settings.reviewTools.includes(toolNames.reinforceMemory) ? reviewEvidence(ctx.sessionManager.getBranch(), messages) : undefined;
+      if (evidence) {
         const target = getStore();
-        const original = ctx.sessionManager.getBranch().flatMap((entry) => {
-          if (entry.type !== "message") return [];
-          const message = entry.message;
-          if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") return [];
-          return messages.some(({ role, timestamp }) => role === message.role && timestamp === message.timestamp) ? [entry] : [];
-        });
         available.push(operation(toolNames.reinforceMemory,
-          "Boost an existing same-scope memory for a new incident. Supply a unique verbatim excerpt of the original evidence from this session.",
-          Type.Object({ id: Type.String({ minLength: 1 }), evidence: Type.String({ minLength: 1 }) }), async ({ id, evidence }, signal) => {
-            const quote = evidence.trim();
-            const matches = quote ? original.filter(({ message }) => "content" in message && contentText(message.content).includes(quote)) : [];
-            if (matches.length !== 1) throw new Error("Quote unique original evidence from an active session message");
-            const entry = matches[0];
-            const incident = createHash("sha256").update(JSON.stringify([entry.id, entry.message.timestamp])).digest("hex");
+          "Boost an existing same-scope memory for a new incident. Supply the original evidence messageId shown in its Smart Mem label and a verbatim excerpt from that message.",
+          Type.Object({ id: Type.String({ minLength: 1 }), messageId: Type.String({ minLength: 1 }), evidence: Type.String({ minLength: 1 }) }), async ({ id, messageId, evidence: quote }, signal) => {
+            const incident = evidence.incident(messageId, quote.trim());
+            if (!incident) return { value: { reinforced: false, reason: "Evidence must quote the cited active session message verbatim" }, saved: false };
             const saved = await target.reinforce(id, incident, signal);
             return { value: { reinforced: saved }, saved };
           }));
       }
       const task = reviewTask(settings, trigger, request);
-      await runModel(ctx, messages, reinforce ? `${task}\n\n${prompt(settings, "reinforce")}` : task, available, {
+      await runModel(ctx, evidence?.messages ?? messages, evidence ? `${task}\n\n${prompt(settings, "reinforce")}` : task, available, {
         settings, reviewer: true, signal, report, reasoning: pi.getThinkingLevel(),
       });
     });
