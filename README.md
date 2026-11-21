@@ -73,7 +73,7 @@ Run `/psm-setup` or choose **Embedding model** in `/psm-settings` to check again
 
 ## Migrate from pi-hermes-memory
 
-Close other Pi sessions using Hermes or Smart Mem, then run `/psm-migrate-hermes` in a main Pi session. One run imports global and project memories, skills, and pins. All Hermes failures become global workflow failures. Project folders are matched automatically; the command reports IDs for imported projects it could not match. Hermes files stay unchanged.
+Close other Pi sessions using Hermes or Smart Mem, then run `/psm-migrate-hermes` in a main Pi session. One run imports global and project memories, skills, and pins. Hermes failures with a saved project tag stay project-scoped; untagged failures stay global. Project folders are matched automatically; the command reports IDs for imported projects it could not match. Hermes files stay unchanged.
 
 `/psm-migrate-hermes --force` **replaces existing Smart Mem data**, including memories, links, skills, pins, and the transcript index. Without `--force`, migration refuses to replace a populated store. Neither form deletes Pi transcripts; use Smart Mem's transcript backfill to rebuild the index.
 

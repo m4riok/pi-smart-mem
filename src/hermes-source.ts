@@ -19,9 +19,16 @@ const list = async (path: string) => (await readdir(path, { withFileTypes: true 
 const isDirectory = async (path: string) => (await stat(path).catch(missing))?.isDirectory() ?? false;
 
 async function memoryFile(path: string, category: Category, project?: string): Promise<HermesMemory[]> {
-  return (await readOptional(path) ?? "").split(/\r?\n§\r?\n/).map((entry) => entry
-    .replace(/\s*<!--\s*created=[^,]+,\s*last=[^,>]+(?:,\s*project64=[A-Za-z0-9_-]+)?\s*-->\s*$/, "").trim())
-    .filter(Boolean).map((text) => ({ text, category, project }));
+  return (await readOptional(path) ?? "").split(/\r?\n§\r?\n/).flatMap((entry) => {
+    const metadata = entry.match(/\s*<!--\s*created=[^,]+,\s*last=[^,>]+(?:,\s*project64=([A-Za-z0-9_-]+))?\s*-->\s*$/);
+    const text = (metadata ? entry.slice(0, metadata.index) : entry).trim();
+    if (!text) return [];
+    if (category === "global_workflow_failure" && metadata?.[1]) {
+      const failureProject = Buffer.from(metadata[1], "base64url").toString("utf8").trim();
+      if (failureProject) return [{ text, category: "local_failure" as const, project: failureProject }];
+    }
+    return [{ text, category, project }];
+  });
 }
 
 async function pinFile(path: string, project?: string): Promise<HermesPin[]> {
@@ -101,14 +108,14 @@ export async function readHermesSource(agentDir: string, cwd: string): Promise<H
   ];
   const skills = await skillsFolder(join(globalDir, "skills"));
   const pins = await pinFile(join(globalDir, "STANDING.md"));
-  const projects: string[] = [];
+  const projects = new Set(memories.flatMap(({ project }) => project === undefined ? [] : [project]));
   for (const item of await list(projectRoot)) {
     if (!item.isDirectory()) continue;
     const path = join(projectRoot, item.name);
     const notes = await memoryFile(join(path, "MEMORY.md"), "repository_information", item.name);
     const procedures = await skillsFolder(join(path, "skills"), item.name);
     if (!notes.length && !procedures.length) continue;
-    projects.push(item.name);
+    projects.add(item.name);
     memories.push(...notes);
     skills.push(...procedures);
   }

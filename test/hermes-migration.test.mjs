@@ -27,7 +27,11 @@ async function fixture(t) {
   const files = new Map([
     [join(hermes, "MEMORY.md"), "Keep notes concise <!-- created=2026-01-01, last=2026-01-02 -->\n§\nSummarize changes"],
     [join(hermes, "USER.md"), "Prefer short feedback"],
-    [join(hermes, "failures.md"), "PROJECT-shop: Check exit status <!-- created=2026-01-01, last=2026-01-02, project64=c2hvcA -->"],
+    [join(hermes, "failures.md"), [
+      "PROJECT-shop: Check exit status <!-- created=2026-01-01, last=2026-01-02, project64=c2hvcA -->",
+      "Verify the result of a global operation",
+      `PROJECT-failure-only: Recheck the query <!-- created=2026-01-01, last=2026-01-02, project64=${Buffer.from("failure-only").toString("base64url")} -->`,
+    ].join("\n§\n")],
     [join(hermes, "STANDING.md"), "# Pins\n- Preserve fixtures"],
     [join(hermes, "skills", "verify", "SKILL.md"), skill("Global verification")],
     [join(projectRoot, "shop", "MEMORY.md"), "Use pnpm"],
@@ -50,22 +54,28 @@ async function fixture(t) {
     migrate: (force, encoder = embed) => migrateHermes({ source, dbPath, force, embed: encoder, progress: () => {} }) };
 }
 
-test("bulk import maps Hermes projects, global failures, skills and pins without changing source files", async (t) => {
+test("bulk import preserves Hermes project and global failure attribution, skills and pins", async (t) => {
   const { hermes, folder, store, source, dbPath, files, migrate, root } = await fixture(t);
   assert.equal(source.folders.get("shop"), folder);
   assert.equal(await store.hasStoredData(), false);
   const result = await migrate(false);
-  assert.equal(result.projects, 2);
-  assert.deepEqual(result.unmatchedProjects.map(({ name }) => name), ["retired"]);
+  assert.equal(result.projects, 3);
+  const unmatched = new Map(result.unmatchedProjects.map(({ name, id }) => [name, id]));
+  assert.deepEqual([...unmatched.keys()].sort(), ["failure-only", "retired"]);
   const localId = await resolveProject(folder, dbPath);
   const local = new MemoryStore(localId, dbPath);
   const archive = new Archive(dbPath, localId);
   const global = await store.list("global");
-  assert.deepEqual(global.map(({ text }) => text).sort(), ["Keep notes concise", "PROJECT-shop: Check exit status", "Prefer short feedback", "Summarize changes"]);
-  assert.equal(global.find(({ text }) => text.includes("exit status")).category, "global_workflow_failure");
-  assert.deepEqual((await local.list("project")).map(({ text }) => text), ["Use pnpm"]);
-  assert.equal((await local.search({ text: "pnpm", embedding, limit: 8, scope: "project" })).length, 1);
-  const retired = new MemoryStore(result.unmatchedProjects[0].id, dbPath);
+  assert.deepEqual(global.map(({ text }) => text).sort(), ["Keep notes concise", "Prefer short feedback", "Summarize changes", "Verify the result of a global operation"]);
+  assert.equal(global.find(({ text }) => text.includes("global operation")).category, "global_workflow_failure");
+  const projectNotes = await local.list("project");
+  assert.deepEqual(projectNotes.map(({ text }) => text).sort(), ["PROJECT-shop: Check exit status", "Use pnpm"]);
+  assert.equal(projectNotes.find(({ text }) => text.includes("exit status")).category, "local_failure");
+  const [top] = await local.search({ text: "pnpm", embedding, limit: 8, scope: "project" });
+  assert.equal(top.text, "Use pnpm");
+  const failureOnly = new MemoryStore(unmatched.get("failure-only"), dbPath);
+  assert.deepEqual((await failureOnly.list("project")).map(({ text }) => text), ["PROJECT-failure-only: Recheck the query"]);
+  const retired = new MemoryStore(unmatched.get("retired"), dbPath);
   assert.deepEqual((await retired.list("project")).map(({ text }) => text), ["Archived design choice"]);
   assert.deepEqual((await archive.searchSkills("verification")).map(({ name, scope }) => [name, scope]), [["Global verification", "Global"], ["Local verification", "Project"]]);
   assert.deepEqual(await archive.pins(), ["Preserve fixtures"]);
