@@ -23,6 +23,7 @@ export async function withDatabase<T>(
   path: string,
   initialize: boolean,
   action: (db: Surreal) => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
   const directory = resolve(path);
   if (initialize) await mkdir(dirname(directory), { recursive: true, mode: 0o700 });
@@ -39,5 +40,5 @@ export async function withDatabase<T>(
     } finally {
       await db.close();
     }
-  });
+  }, signal);
 }

@@ -1,33 +1,40 @@
 import type { Message } from "@earendil-works/pi-ai";
-import type { Diagnostics } from "./diagnostics.ts";
+import { traceDecision, type MaintenanceDiagnostics } from "./maintenance-trace.ts";
 import { Type } from "typebox";
 import type { Embedding, Memory, MemoryStore, Scope } from "./memory-store.ts";
 import { operation, toolNames } from "./memory-tools.ts";
 import { runModel, type ModelContext } from "./review.ts";
-import { prompt, type Settings } from "./settings.ts";
+import { minConsolidationSavings, prompt, type Settings } from "./settings.ts";
 
 type MaintenanceFailure = { scope: Scope; noteId: string; attempt: 1 | 2; reason: string };
 export const maintenanceShortlistSize = 8;
 export type MaintenanceResult = { changes: number; skipped: number };
 type Options = {
-  kind: "link" | "consolidate"; scopes: Scope[]; automatic?: boolean; store: MemoryStore; ctx: ModelContext;
+  kind: "link" | "consolidate"; scopes: Scope[]; automatic?: boolean; full?: boolean; store: MemoryStore; ctx: ModelContext;
   messages: Message[]; settings: Settings; embed: (text: string, signal?: AbortSignal) => Promise<Embedding>;
   progress: (text: string) => void; signal?: AbortSignal; onFailure?: (failure: MaintenanceFailure) => void;
-  diagnostics?: Pick<Diagnostics, "debug">;
+  diagnostics?: MaintenanceDiagnostics;
 };
 
 class MissingDecision extends Error {}
+
+function savesEnough(source: string, replacement: string): boolean {
+  const original = Array.from(source).length;
+  const saved = original - Array.from(replacement).length;
+  return saved >= minConsolidationSavings.characters && saved * 100 >= original * minConsolidationSavings.percent;
+}
 
 async function judgeNote(options: Options, id: string, attempt: 1 | 2, retryDecision: boolean, result: MaintenanceResult) {
   const { store, kind, settings, ctx, messages, embed, signal } = options;
   const source = await store.read(id);
   if (!source) return;
+  const consolidate = kind === "consolidate";
+  if (consolidate && options.full && attempt === 1) await store.markConsolidated(source, false, signal);
   const candidates = await store.candidates(source, maintenanceShortlistSize, kind === "consolidate");
   if (kind === "link" && candidates.length === 0) { await store.markReviewed(source, signal); return; }
   const allowed = new Map(candidates.map((candidate) => [candidate.id, candidate]));
   const payload = { source, candidates };
   const input = JSON.stringify(payload);
-  const consolidate = kind === "consolidate";
   const task = consolidate
     ? [prompt(settings, "consolidate"), retryDecision && prompt(settings, "consolidateRetry")].filter(Boolean).join("\n\n")
     : [prompt(settings, "precedence"), prompt(settings, "link"), input,
@@ -35,12 +42,13 @@ async function judgeNote(options: Options, id: string, attempt: 1 | 2, retryDeci
   const modelContext = consolidate ? { ...ctx, getSystemPrompt: () => "" } : ctx;
   const exchange: Message[] = consolidate ? [{ role: "user", content: input, timestamp: 0 }] : messages;
   let judged = false;
+  const linked: string[] = [];
   const tool = kind === "link"
     ? operation(toolNames.selectLinks, "Submit selected target IDs, or an empty list.", Type.Object({ ids: Type.Array(Type.String()) }), async ({ ids }) => {
       if (ids.some((id) => !allowed.has(id))) throw new Error("Target not shortlisted");
       for (const id of new Set(ids)) {
         signal?.throwIfAborted();
-        if (await store.link(source.id, id, signal)) result.changes++;
+        if (await store.link(source.id, id, signal)) { result.changes++; linked.push(id); }
       }
       judged = true;
       return { value: { changes: result.changes } };
@@ -52,18 +60,16 @@ async function judgeNote(options: Options, id: string, attempt: 1 | 2, retryDeci
         return candidate;
       });
       if (removed.length && !text) throw new Error("A merge needs replacement text");
-      if (text && (text !== source.text || removed.length) && await store.merge(source, removed, text, await embed(text, signal), signal)) result.changes++;
+      if (text && (removed.length || savesEnough(source.text, text))) {
+        if (await store.merge(source, removed, text, await embed(text, signal), signal, true)) result.changes++;
+      } else await store.markConsolidated(source, true, signal);
       judged = true;
       return { value: { changes: result.changes } };
     });
-  const debug = consolidate && settings.debugLogging ? options.diagnostics : undefined;
-  const trace = { noteId: source.id, scope: source.scope, attempt };
-  void debug?.debug("consolidation.request", { ...trace, input: payload });
+  const debug = settings.debugLogging && !options.automatic ? options.diagnostics : undefined;
+  const trace = traceDecision(debug, consolidate ? "consolidation" : "linking", { noteId: source.id, scope: source.scope, attempt }, payload);
   const report = await runModel(modelContext, exchange, task, [tool], {
-    settings, signal, done: (call) => judged || call.isError,
-    onResponse: debug && (({ content, stopReason, errorMessage }) => {
-      void debug.debug("consolidation.response", { ...trace, content, stopReason, errorMessage });
-    }),
+    settings, signal, done: (call) => judged || call.isError, onResponse: trace?.onResponse,
   });
   signal?.throwIfAborted();
   const failure = report.calls.find(({ isError }) => isError);
@@ -71,19 +77,23 @@ async function judgeNote(options: Options, id: string, attempt: 1 | 2, retryDeci
     // Pi's validation error appends the full tool arguments. For consolidation,
     // keep those in the opt-in reply trace, not in the ordinary failure log.
     const error = String(failure.result);
-    const reason = consolidate ? error.split("\n\nReceived arguments:\n", 1)[0] : error;
+    const reason = !options.automatic ? error.split("\n\nReceived arguments:\n", 1)[0] : error;
     throw new Error(`${failure.name}: ${reason}`);
   }
   if (!judged) throw new MissingDecision(`No ${kind} decision`);
-  if (kind === "link") await store.markReviewed(source, signal);
+  if (kind === "link") {
+    await store.markReviewed(source, signal);
+    trace?.result({ linked });
+  }
 }
 
 export async function maintain(options: Options): Promise<MaintenanceResult> {
-  const { kind, scopes, automatic, store, settings, progress, signal, onFailure } = options;
+  const { kind, scopes, automatic, full, store, settings, progress, signal, onFailure } = options;
+  if (kind === "consolidate") await store.prepareConsolidation(signal);
   const result = { changes: 0, skipped: 0 };
   for (const scope of scopes) {
     signal?.throwIfAborted();
-    const notes = await store.list(scope, automatic);
+    const notes = await store.list(scope, kind === "consolidate" && !full ? "unconsolidated" : automatic);
     if (automatic && notes.length < settings.linkThreshold) continue;
     for (const [i, note] of notes.entries()) {
       signal?.throwIfAborted();

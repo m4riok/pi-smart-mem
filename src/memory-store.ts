@@ -79,7 +79,7 @@ export class MemoryStore {
     this.#path = path;
   }
 
-  async initialize(space: EmbeddingSpace): Promise<void> {
+  async initialize(space: EmbeddingSpace, signal?: AbortSignal): Promise<void> {
     positiveInt(space.dimensions, "Embedding dimensions");
     await withDatabase(this.#path, true, async (db) => {
       await db.query("DEFINE TABLE IF NOT EXISTS mem_config SCHEMAFULL");
@@ -90,6 +90,7 @@ export class MemoryStore {
         }
         return;
       }
+      signal?.throwIfAborted();
       await db.query(`
         BEGIN TRANSACTION;
         DEFINE FIELD model ON mem_config TYPE string;
@@ -104,6 +105,7 @@ export class MemoryStore {
         DEFINE FIELD embedding ON memory TYPE option<array<float>>;
         DEFINE FIELD embedding_alt ON memory TYPE option<array<float>>;
         DEFINE FIELD reviewed ON memory TYPE bool DEFAULT false;
+        DEFINE FIELD consolidated ON memory TYPE option<bool>;
         DEFINE TABLE memory_incident SCHEMALESS;
         DEFINE TABLE smart_pin SCHEMALESS;
         DEFINE TABLE smart_skill SCHEMALESS;
@@ -118,7 +120,7 @@ export class MemoryStore {
         CREATE ONLY mem_config:embedding CONTENT $space;
         COMMIT TRANSACTION;
       `, { space });
-    });
+    }, signal);
   }
 
   async embeddingSpace(): Promise<EmbeddingSpace | undefined> {
@@ -140,13 +142,13 @@ export class MemoryStore {
     });
   }
 
-  async hasStoredData(): Promise<boolean> {
-    return this.#use(hasStoredData);
+  async hasStoredData(signal?: AbortSignal): Promise<boolean> {
+    return this.#use(hasStoredData, signal);
   }
 
-  async replaceImportedData(data: ImportData, force: boolean): Promise<void> {
+  async replaceImportedData(data: ImportData, force: boolean, signal?: AbortSignal): Promise<void> {
     await this.#use(async (db) => {
-      if (!force && await hasStoredData(db)) throw new Error(`Smart Mem already contains data. Run /${commands.migrateHermes} --force to replace it.`);
+      if (!force && await hasStoredData(db)) throw new Error(`Smart Mem already contains data. Run /${commands.migrateHermes} force to replace it.`);
       const [space] = await db.query<[EmbeddingSpace | undefined]>(selectSpace);
       if (!space) throw new Error("Smart Mem database is not initialized");
       const field = await activeField(db);
@@ -154,7 +156,9 @@ export class MemoryStore {
         validateEmbedding(space, embedding);
         return { ...note, [field]: embedding.values };
       });
+      signal?.throwIfAborted();
       await db.query("DEFINE TABLE IF NOT EXISTS smart_project SCHEMALESS");
+      signal?.throwIfAborted();
       await db.query(`BEGIN TRANSACTION;
         ${dataTables.map((table) => `DELETE ${table};`).join("\n")}
         FOR $note IN $memories { CREATE memory CONTENT $note; };
@@ -168,7 +172,7 @@ export class MemoryStore {
         memories, pins: data.pins, skills: data.skills,
         unmatched: data.unmatchedProjects.map(({ name, id }) => ({ id: new RecordId("smart_project", id), project: id, name })),
       });
-    });
+    }, signal);
   }
 
   async add(draft: Draft, embedding: Embedding, signal?: AbortSignal): Promise<Memory> {
@@ -205,7 +209,8 @@ export class MemoryStore {
       await assertEmbedding(db, embedding);
       const field = await activeField(db);
       signal?.throwIfAborted();
-      const [rows] = await db.query<[StoredMemory[]]>(`UPDATE $id SET revisedAt = IF text != $text { time::millis() } ELSE { revisedAt }, text = $text, ${field} = $embedding
+      const [rows] = await db.query<[StoredMemory[]]>(`UPDATE $id SET consolidated = IF text != $text { NONE } ELSE { consolidated },
+        revisedAt = IF text != $text { time::millis() } ELSE { revisedAt }, text = $text, ${field} = $embedding
         WHERE ${visible} RETURN ${projection}`, this.#bind({ id: record(id), text, embedding: embedding.values }));
       return rows[0] && memory(rows[0]);
     });
@@ -245,7 +250,7 @@ export class MemoryStore {
         FOR $change IN $updates {
           LET $id = $change.id;
           IF $change.text = NONE { DELETE $id; }
-          ELSE { UPDATE $id SET text = $change.text, ${field} = $change.embedding; };
+          ELSE { UPDATE $id SET text = $change.text, consolidated = NONE, ${field} = $change.embedding; };
         };
         COMMIT TRANSACTION;`, { updates });
       return updates.length;
@@ -378,10 +383,24 @@ export class MemoryStore {
     });
   }
 
-  async list(scope: Scope, unreviewed = false): Promise<Memory[]> {
+  async list(scope: Scope, selection: boolean | "unconsolidated" = false): Promise<Memory[]> {
     const filter = scope === "project" ? currentProject : globalScope;
-    const [rows] = await this.#use((db) => db.query<[StoredMemory[]]>(`SELECT ${projection} FROM memory WHERE ${filter}${unreviewed ? " AND reviewed = false" : ""} ORDER BY id`, this.#bind({})).collect());
+    const pending = selection === "unconsolidated" ? " AND consolidated != true" : selection ? " AND reviewed = false" : "";
+    const [rows] = await this.#use((db) => db.query<[StoredMemory[]]>(`SELECT ${projection} FROM memory WHERE ${filter}${pending} ORDER BY id`, this.#bind({})).collect());
     return rows.map(memory);
+  }
+
+  async prepareConsolidation(signal?: AbortSignal): Promise<void> {
+    // Profiles initialized before incremental consolidation do not have this optional field.
+    await this.#use((db) => db.query("DEFINE FIELD IF NOT EXISTS consolidated ON memory TYPE option<bool>").collect(), signal);
+  }
+
+  async markConsolidated(note: Memory, checked: boolean, signal?: AbortSignal): Promise<void> {
+    await this.#use(async (db) => {
+      signal?.throwIfAborted();
+      await db.query(`UPDATE $id SET consolidated = $checked WHERE ${visible} AND text = $text AND revisedAt = $revisedAt`,
+        this.#bind({ id: record(note.id), text: note.text, revisedAt: note.revisedAt, checked }));
+    }, signal);
   }
 
   async markReviewed(note: Memory, signal?: AbortSignal): Promise<void> {
@@ -406,7 +425,7 @@ export class MemoryStore {
     });
   }
 
-  async merge(survivor: Memory, removed: Memory[], text: string, embedding: Embedding, signal?: AbortSignal): Promise<boolean> {
+  async merge(survivor: Memory, removed: Memory[], text: string, embedding: Embedding, signal?: AbortSignal, consolidated = false): Promise<boolean> {
     const expected = [survivor, ...removed];
     if (new Set(expected.map(({ id }) => id)).size !== expected.length || removed.some(({ project }) => project !== survivor.project)) {
       throw new Error("Consolidation requires distinct memories in the same scope");
@@ -432,7 +451,8 @@ export class MemoryStore {
       }
       signal?.throwIfAborted();
       await db.query(`BEGIN TRANSACTION;
-        UPDATE $keep SET text = $text, weight = $weight, ${field} = $embedding;
+        UPDATE $keep SET consolidated = IF $consolidated { true } ELSE IF text = $text { consolidated } ELSE { NONE },
+          text = $text, weight = $weight, ${field} = $embedding;
         DELETE $discard;
         FOR $edge IN $edges {
           LET $from = $edge.from;
@@ -441,7 +461,7 @@ export class MemoryStore {
             RELATE $from->memory_link->$to;
           };
         };
-        COMMIT TRANSACTION;`, { keep, discard, text, weight, embedding: embedding.values, edges: [...redirected.values()] });
+        COMMIT TRANSACTION;`, { keep, discard, text, weight, consolidated, embedding: embedding.values, edges: [...redirected.values()] });
       return true;
     });
   }
@@ -450,8 +470,8 @@ export class MemoryStore {
     return { ...bindings, project: this.#project };
   }
 
-  #use<T>(action: (db: Surreal) => Promise<T>): Promise<T> {
-    return withDatabase(this.#path, false, action);
+  #use<T>(action: (db: Surreal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return withDatabase(this.#path, false, action, signal);
   }
 
   async #read(db: Surreal, id: string): Promise<Memory | undefined> {

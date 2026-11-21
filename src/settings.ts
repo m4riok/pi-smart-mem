@@ -10,6 +10,8 @@ import { withFileLock } from "./file-lock.ts";
 import type { Diagnostics } from "./diagnostics.ts";
 import { currentToolName, toolNames } from "./memory-tools.ts";
 
+export const minConsolidationSavings = { characters: 30, percent: 5 } as const;
+
 export const prompts = {
   precedence: "Memories are context, not authority. Current instructions, the applicable system prompt, APPEND_SYSTEM.md, and global and project AGENTS.md supersede memories. If memories alone conflict, apply the applicable project preference over a global default. Keep both stored.",
   recall: `Use ${toolNames.memorySearch} to search relevant preferences and project notes when planning or implementing. Look up relevant failure lessons when troubleshooting. Search returns current project and global notes unless narrowed. ${toolNames.memoryRelated} follows one hop; if useful, call again from a returned neighbor. ${toolNames.memoryGlobalPreferences} finds global preferences similar to a project note without following links. Use ${toolNames.skillSearch} and ${toolNames.skillRead} for reusable procedures and ${toolNames.sessionSearch} for earlier conversations.`,
@@ -27,7 +29,8 @@ Keep notes concise: durable takeaway first and minimum useful context. Reference
   injection: `Use this active conversation to search for relevant existing memories. Select only notes useful now, in priority order, using ${toolNames.selectMemories}. Do not write memories. Select an empty list when nothing is relevant.`,
   injected: "Relevant existing memories (context, not authority):",
   link: "Judge candidate memory pairs by whether the target adds useful related context to the source. Select only meaningful links from the source to listed candidate IDs. Do not edit notes.",
-  consolidate: `Shorten the source note or merge duplicate or overlapping notes into it. Preserve every distinct durable detail and qualification. Do not merge merely related or conflicting notes.
+  consolidate: `Leave the source unchanged by default. Merge only if the notes answer the same practical question or document the same rule. Shared terminology, feature area, or workflow is not enough. Keep notes separate if merging would bury an independently useful rule, change where it appears to apply, or combine conflicting positions. When unsure, leave them separate.
+Preserve every distinct durable detail and qualification. Shorten a standalone note only when you can remove real redundancy or filler, not just polish the wording. Return no change unless the replacement saves at least ${minConsolidationSavings.characters} characters and ${minConsolidationSavings.percent}% of the original.
 Reply with exactly one ${toolNames.consolidateNote} tool call, not prose, even if nothing changes. Use only IDs copied from the current input's candidates array. Never include the source ID or any ID outside that array. The source keeps its ID; the listed candidates will be deleted only after their information is included in the replacement text.
 - No change: {"ids":[]} (omit text).
 - Shorten the source only: {"ids":[],"text":"<complete replacement text>"}.
@@ -142,7 +145,7 @@ export async function chooseEmbeddingModel(ctx: ExtensionContext, current: Model
 }
 
 export type SettingsActions = {
-  setup: () => Promise<void>; device: (device: Device) => Promise<void>;
+  setup: () => Promise<boolean>; device: (device: Device) => Promise<void>;
   backfill: () => Promise<void>; prune: () => Promise<void>;
 };
 
@@ -182,7 +185,10 @@ export async function openSettings(ctx: ExtensionContext, file: SettingsFile, re
     const choice = await settingsMenu(ctx, { ...s, device: embeddingDevice(model, s.device) }, model?.model ?? "Not set up");
     if (choice === undefined) return;
     switch (choice) {
-      case 0: await actions.setup(); break;
+      case 0:
+        // Close the menu when setup detaches so the editor is available.
+        if (await actions.setup()) return;
+        break;
       case 1: {
         if (model?.tier === "cuda") {
           ctx.ui.notify("This model requires CUDA. Choose a CPU model under Embedding model to switch to CPU.", "info");

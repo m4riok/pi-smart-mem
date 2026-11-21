@@ -50,7 +50,7 @@ export async function conflictGuidance(options: ReturnType<ExtensionCommandConte
 async function cleanAgainstGuidance(options: BatchOptions, guidance: Guidance, embed: Embed): Promise<MaintenanceResult> {
   const { store, settings } = options;
   const scopes = options.scopes.filter((scope) => guidance[scope].length > 0);
-  return runBatches({ ...options, scopes }, "Checking guidance for", async (scope, notes) => {
+  return runBatches({ ...options, scopes }, "Checking guidance for", async (fields, notes) => {
     let changes = 0;
     const tool = operation(toolNames.cleanupGuidance, "Submit only directly conflicting notes from this batch. Supply replacement text, or null if no durable content remains.",
       Type.Object({ updates: Type.Array(Type.Object({ id, text: Type.Union([replacementText, Type.Null()]) })) }), async ({ updates }, signal) => {
@@ -64,7 +64,7 @@ async function cleanAgainstGuidance(options: BatchOptions, guidance: Guidance, e
         changes = await store.cleanGuidance(replacements, signal);
         return { value: { changes } };
       });
-    await requestDecision(options, prompt(settings, "cleanupGuidance"), { guidance: guidance[scope], notes }, tool);
+    await requestDecision(options, fields, prompt(settings, "cleanupGuidance"), { guidance: guidance[fields.scope], notes }, tool);
     return changes;
   });
 }
@@ -76,7 +76,7 @@ async function cleanAgainstMemories(options: BatchOptions, embed: Embed): Promis
     signal?.throwIfAborted();
     const notes = await store.list(scope);
     for (const [i, { id: sourceId }] of notes.entries()) {
-      const outcome = await retryDecision(options, scope, [sourceId], `Checking ${scope} memory conflicts: ${i + 1}/${notes.length}`, async () => {
+      const outcome = await retryDecision(options, scope, [sourceId], `Checking ${scope} memory conflicts: ${i + 1}/${notes.length}`, async (fields) => {
         const source = await store.read(sourceId);
         if (!source) return 0;
         const candidates = await store.candidates(source, maintenanceShortlistSize, true);
@@ -94,7 +94,7 @@ async function cleanAgainstMemories(options: BatchOptions, embed: Embed): Promis
             if (await store.merge(keep, remove, replacement, embedding, signal)) changes = remove.length;
             return { value: { changes } };
           });
-        await requestDecision(options, prompt(settings, "cleanupMemory"), { source, candidates }, tool);
+        await requestDecision(options, fields, prompt(settings, "cleanupMemory"), { source, candidates }, tool);
         return changes;
       });
       total.changes += outcome.changes;

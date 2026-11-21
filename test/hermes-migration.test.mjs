@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { Archive } from "../src/archive.ts";
+import { withFileLock } from "../src/file-lock.ts";
 import { migrateHermes } from "../src/hermes-migration.ts";
 import { readHermesSource } from "../src/hermes-source.ts";
 import { MemoryStore } from "../src/memory-store.ts";
@@ -91,6 +92,23 @@ test("bulk import preserves Hermes project and global failure attribution, skill
   assert.deepEqual(await readHermesSource(join(root, "agent"), root), source);
 });
 
+test("aborting while the import waits for the database lock prevents replacement", { timeout: 10_000 }, async (t) => {
+  const { dbPath, store } = await fixture(t);
+  const existing = await store.add({ scope: "global", kind: "note", text: "Existing fixture" }, embedding);
+  const controller = new AbortController();
+  const writing = Promise.withResolvers();
+  const source = { memories: [{ kind: "note", text: "Import fixture" }], pins: [], skills: [], folders: new Map() };
+  await withFileLock(`${dbPath}.lock`, async () => {
+    const result = migrateHermes({ source, dbPath, force: true, embed, signal: controller.signal, progress: (message) => {
+      if (message === "Writing imported Hermes data") writing.resolve();
+    } });
+    await writing.promise;
+    controller.abort();
+    await assert.rejects(result, { name: "AbortError" });
+  });
+  assert.deepEqual(await store.list("global"), [existing]);
+});
+
 test("populated store requires force; failed embedding leaves existing data intact", async (t) => {
   const { store, dbPath, migrate, root } = await fixture(t);
   const old = await store.add({ scope: "global", kind: "preference", text: "Old saved note" }, embedding);
@@ -103,7 +121,7 @@ test("populated store requires force; failed embedding leaves existing data inta
     { type: "session", version: 3, id: "old-session", cwd: root },
     { type: "message", id: "old-message", timestamp: "2026-01-01T00:00:00Z", message: { role: "user", content: "Old transcript" } },
   ]);
-  await assert.rejects(migrate(false, () => assert.fail("Must reject before embedding")), /--force/);
+  await assert.rejects(migrate(false, () => assert.fail("Must reject before embedding")), /psm-migrate-hermes force/);
   await assert.rejects(migrate(true, async () => { throw new Error("Embedding failure"); }), /Embedding failure/);
   assert.equal((await store.read(old.id)).text, "Old saved note");
   assert.equal((await store.related(old.id))[0].id, other.id);

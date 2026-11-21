@@ -2,6 +2,7 @@ import { Type } from "typebox";
 import type { Memory, MemoryStore, Scope } from "./memory-store.ts";
 import { memoryKind, operation, toolNames, type Operation } from "./memory-tools.ts";
 import type { MaintenanceResult } from "./maintenance.ts";
+import { traceDecision, type MaintenanceDiagnostics } from "./maintenance-trace.ts";
 import { runModel, type ModelContext } from "./review.ts";
 import { prompt, type Settings } from "./settings.ts";
 
@@ -11,17 +12,21 @@ export type BatchOptions = {
   scopes: Scope[]; ctx: ModelContext; store: MemoryStore; settings: Settings;
   progress: (message: string) => void; signal?: AbortSignal;
   onFailure: (scope: Scope, noteIds: string[], attempt: 1 | 2, reason: string) => void;
+  diagnostics?: MaintenanceDiagnostics;
 };
 
-type DecisionContext = Pick<BatchOptions, "ctx" | "settings" | "signal">;
-export async function requestDecision({ ctx, settings, signal }: DecisionContext, task: string, input: unknown, tool: Operation) {
+type DecisionContext = Pick<BatchOptions, "ctx" | "settings" | "signal" | "diagnostics">;
+type Attempt = { scope: Scope; noteIds: string[]; attempt: 1 | 2 };
+export async function requestDecision({ ctx, settings, signal, diagnostics }: DecisionContext, fields: Attempt, task: string, input: unknown, tool: Operation) {
   const model = { ...ctx, getSystemPrompt: () => "" };
+  const trace = traceDecision(settings.debugLogging ? diagnostics : undefined, "maintenance.decision", { ...fields, tool: tool.name }, input);
   const report = await runModel(model, [{ role: "user", content: JSON.stringify(input), timestamp: 0 }], task, [tool], {
-    settings, signal, done: () => true,
+    settings, signal, done: () => true, onResponse: trace?.onResponse,
   });
   const call = report.calls[0];
   if (!call) throw new Error(`Model did not call ${tool.name}`);
   if (call.isError) throw new Error(String(call.result).split("\n\nReceived arguments:\n", 1)[0]);
+  trace?.result(call.result);
 }
 
 export function resolveBatch<T extends { id: string }>(notes: readonly Memory[], updates: readonly T[]): { note: Memory; update: T }[] {
@@ -34,12 +39,12 @@ export function resolveBatch<T extends { id: string }>(notes: readonly Memory[],
   });
 }
 
-export async function retryDecision(options: BatchOptions, scope: Scope, ids: string[], status: string, decide: () => Promise<number>): Promise<MaintenanceResult> {
+export async function retryDecision(options: BatchOptions, scope: Scope, ids: string[], status: string, decide: (fields: Attempt) => Promise<number>): Promise<MaintenanceResult> {
   const { progress, signal, onFailure } = options;
   for (const attempt of [1, 2] as const) {
     signal?.throwIfAborted();
     progress(attempt === 1 ? status : `${status} · retrying`);
-    try { return { changes: await decide(), skipped: 0 }; }
+    try { return { changes: await decide({ scope, noteIds: ids, attempt }), skipped: 0 }; }
     catch (error) {
       signal?.throwIfAborted();
       onFailure(scope, ids, attempt, String(error));
@@ -48,7 +53,7 @@ export async function retryDecision(options: BatchOptions, scope: Scope, ids: st
   return { changes: 0, skipped: ids.length };
 }
 
-export async function runBatches(options: BatchOptions, title: string, decide: (scope: Scope, notes: Memory[]) => Promise<number>): Promise<MaintenanceResult> {
+export async function runBatches(options: BatchOptions, title: string, decide: (fields: Attempt, notes: Memory[]) => Promise<number>): Promise<MaintenanceResult> {
   const { scopes, store, signal } = options;
   const result = { changes: 0, skipped: 0 };
   for (const scope of scopes) {
@@ -57,7 +62,7 @@ export async function runBatches(options: BatchOptions, title: string, decide: (
     for (let i = 0; i < notes.length; i += batchSize) {
       const batch = notes.slice(i, i + batchSize);
       const status = `${title} ${scope} memories: ${i + 1}–${i + batch.length}/${notes.length}`;
-      const outcome = await retryDecision(options, scope, batch.map(({ id }) => id), status, () => decide(scope, batch));
+      const outcome = await retryDecision(options, scope, batch.map(({ id }) => id), status, (fields) => decide(fields, batch));
       result.changes += outcome.changes;
       result.skipped += outcome.skipped;
     }
@@ -67,7 +72,7 @@ export async function runBatches(options: BatchOptions, title: string, decide: (
 
 export async function reclassifyMemories(options: BatchOptions): Promise<MaintenanceResult> {
   const { store, settings } = options;
-  return runBatches(options, "Reclassifying", async (_scope, notes) => {
+  return runBatches(options, "Reclassifying", async (fields, notes) => {
     let changes = 0;
     const tool = operation(toolNames.reclassify, "Submit changed kinds using IDs from this batch. Submit an empty updates list if none.",
       Type.Object({ updates: Type.Array(Type.Object({ id, kind: memoryKind })) }), async ({ updates }, signal) => {
@@ -75,7 +80,7 @@ export async function reclassifyMemories(options: BatchOptions): Promise<Mainten
         changes = await store.reclassify(classified, signal);
         return { value: { changes } };
       });
-    await requestDecision(options, prompt(settings, "reclassify"), { notes }, tool);
+    await requestDecision(options, fields, prompt(settings, "reclassify"), { notes }, tool);
     return changes;
   });
 }

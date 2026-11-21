@@ -4,6 +4,8 @@ import type { Inventory, ScopedInventory } from "./memory-store.ts";
 
 const key = "smart-mem";
 const infoTimeoutMs = 5_000;
+const barFrames = ["━╸··", "·━╸·", "··━╸", "··╺━", "·╺━·", "╺━··"];
+const frameIntervalMs = 120;
 export const memoryPanelShortcut = "alt+u";
 export type Level = "info" | "warning" | "error";
 export type Activity = {
@@ -24,6 +26,8 @@ export class MemoryPanel {
   #running = new Map<symbol, { title: string; detail?: string }>();
   #latest?: Notice;
   #noticeTimer?: ReturnType<typeof setTimeout>;
+  #animation?: ReturnType<typeof setInterval>;
+  #frame = 0;
 
   mount(ui: ExtensionUIContext, active: boolean) {
     this.#ui = ui;
@@ -72,7 +76,16 @@ export class MemoryPanel {
     const id = Symbol();
     const activity = { title, detail: undefined as string | undefined };
     this.#running.set(id, activity);
+    this.#animation ??= setInterval(() => {
+      this.#frame = (this.#frame + 1) % barFrames.length;
+      this.#tui?.requestRender();
+    }, frameIntervalMs).unref();
     this.#tui?.requestRender();
+    const remove = () => {
+      if (!this.#running.delete(id)) return false;
+      if (!this.#running.size) this.#stopAnimation();
+      return true;
+    };
     return {
       update: (detail) => {
         if (!this.#running.has(id)) return;
@@ -80,12 +93,18 @@ export class MemoryPanel {
         this.#tui?.requestRender();
       },
       finish: (summary, level, detail, timeoutMs) => {
-        if (this.#running.delete(id)) this.notice(summary, level, detail, timeoutMs);
+        if (remove()) this.notice(summary, level, detail, timeoutMs);
       },
       clear: () => {
-        if (this.#running.delete(id)) this.#tui?.requestRender();
+        if (remove()) this.#tui?.requestRender();
       },
     };
+  }
+
+  #stopAnimation() {
+    clearInterval(this.#animation);
+    this.#animation = undefined;
+    this.#frame = 0;
   }
 
   dispose() {
@@ -94,15 +113,18 @@ export class MemoryPanel {
     this.#tui = undefined;
     this.#expanded = false;
     this.#running.clear();
+    this.#stopAnimation();
     this.#clearNotice();
     this.#counts = undefined;
   }
 
   #render(width: number, theme: Theme): string[] {
-    const header = `🧠 Memory · ${this.#active ? "Active" : "Not set up"}`;
+    const [current, ...additional] = this.#running.values();
+    const status = current ? (current.detail ?? current.title) : this.#active ? "Active" : "Not set up";
+    const bar = current ? barFrames[this.#frame] : this.#active ? "━━━━" : "····";
     const hint = this.#latest?.detail ? ` · Alt+U ${this.#expanded ? "hide" : "details"}` : "";
     const line = (text: string) => truncateToWidth(clean(text).replaceAll("\n", " "), width);
-    const rows = [theme.fg(this.#active ? "accent" : "warning", line(header + hint))];
+    const rows = [theme.fg(current || this.#active ? "accent" : "warning", line(`🧠 ${bar}  ${status}${hint}`))];
     if (this.#active && this.#counts) {
       const { project, global } = this.#counts;
       const left = `Project: ${project ? tally(project) : "—"}`;
@@ -111,11 +133,10 @@ export class MemoryPanel {
       const counts = combined.length <= width ? [combined] : [`  ${left}`, `  ${right}`];
       rows.push(...counts.map((count) => theme.fg("muted", line(count))));
     }
-    const running = [...this.#running.values()];
-    for (const { title, detail } of running.slice(0, 4)) {
+    for (const { title, detail } of additional.slice(0, 3)) {
       rows.push(theme.fg("muted", line(`  ↻ ${title}${detail ? ` · ${detail}` : ""}`)));
     }
-    if (running.length > 4) rows.push(theme.fg("muted", line(`  +${running.length - 4} more running`)));
+    if (additional.length > 3) rows.push(theme.fg("muted", line(`  +${additional.length - 3} more running`)));
     const latest = this.#latest;
     if (latest) {
       rows.push(theme.fg(latest.level === "info" ? "muted" : latest.level, line(`  ${latest.summary}`)));

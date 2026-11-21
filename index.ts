@@ -37,6 +37,16 @@ function scopedMaintenance(project: string | undefined, args: string): Scope[] {
   return ["project"];
 }
 
+function consolidationOptions(project: string | undefined, args: string): { scopes: Scope[]; full: boolean } {
+  switch (args.trim().replace(/\s+/g, " ")) {
+    case "": return { scopes: scopedMaintenance(project, ""), full: false };
+    case "global": return { scopes: scopedMaintenance(project, "global"), full: false };
+    case "full": return { scopes: scopedMaintenance(project, ""), full: true };
+    case "global full": return { scopes: scopedMaintenance(project, "global"), full: true };
+    default: throw new Error(`Use /${commands.consolidate} [global] [full]`);
+  }
+}
+
 async function fallbackProgress<T>(ctx: ExtensionContext, title: string, action: (report: Progress) => Promise<T>): Promise<T> {
   ctx.ui.setWidget(statusKey, [title]);
   try { return await action((message) => ctx.ui.setWidget(statusKey, [title, message])); }
@@ -64,9 +74,10 @@ export default function smartMemory(pi: ExtensionAPI): void {
   const panel = new MemoryPanel();
   const toolActivity = new Map<string, Activity>();
   let manualMaintenance: AbortController | undefined;
+  let deferredImportIndex: { pending: boolean } | undefined;
   const hasPanel = (ctx: ExtensionContext) => main && ctx.mode === "tui";
-  const present = (ctx: ExtensionContext, message: string, level: Level, detail?: string) => {
-    if (hasPanel(ctx)) panel.notice(message.split("\n", 1)[0], level, detail ?? (message.includes("\n") ? message : undefined));
+  const present = (ctx: ExtensionContext, message: string, level: Level, detail?: string, timeoutMs?: number) => {
+    if (hasPanel(ctx)) panel.notice(message.split("\n", 1)[0], level, detail ?? (message.includes("\n") ? message : undefined), timeoutMs);
     else ctx.ui.notify(message, level);
   };
   const log = new Diagnostics(directory, main ? "pi" : "subagent", (error) => {
@@ -81,11 +92,11 @@ export default function smartMemory(pi: ExtensionAPI): void {
     },
   });
   const begin = (ctx: ExtensionContext, title: string) => hasPanel(ctx) ? panel.begin(title) : undefined;
-  function notify(ctx: ExtensionContext, message: string, level: Level = "info", detail?: string) {
+  function notify(ctx: ExtensionContext, message: string, level: Level = "info", detail?: string, timeoutMs?: number) {
     void log.write("notice", { message }, level);
-    present(ctx, message, level, detail);
+    present(ctx, message, level, detail, timeoutMs);
   }
-  const reportError = (ctx: ExtensionContext, error: unknown) => notify(ctx, `Smart Mem: ${String(error)}`, "error", String(error));
+  const reportError = (ctx: ExtensionContext, error: unknown, timeoutMs?: number) => notify(ctx, `Smart Mem: ${String(error)}`, "error", String(error), timeoutMs);
   async function refreshCounts(ctx: ExtensionContext) {
     if (!panel.mounted || !activePreset) return;
     try { panel.setCounts(await store.inventory()); }
@@ -103,7 +114,8 @@ export default function smartMemory(pi: ExtensionAPI): void {
     finally { activity.clear(); }
   }
   async function runMaintenance(options: Omit<Parameters<typeof maintain>[0], "onFailure" | "diagnostics">) {
-    const batch = { kind: options.kind, scopes: options.scopes.join(","), model: options.ctx.model?.id, automatic: !!options.automatic };
+    const batch = { kind: options.kind, scopes: options.scopes.join(","), model: options.ctx.model?.id, automatic: !!options.automatic,
+      mode: options.kind === "consolidate" ? (options.full ? "full" : "incremental") : undefined };
     let started = false;
     const start = () => { if (!started) { started = true; void log.write("maintenance.start", batch); } };
     if (!options.automatic) start();
@@ -162,16 +174,17 @@ export default function smartMemory(pi: ExtensionAPI): void {
     archive = new Archive(dbPath, project);
   }
 
-  async function setup(ctx: ExtensionContext) {
-    const current = await readActivePreset();
-    const next = await chooseEmbeddingModel(ctx, current, await embeddings.run((worker) => worker.cudaUnavailable()));
+  async function prepareSetup(ctx: ExtensionContext, current: ModelPreset | undefined, signal: AbortSignal) {
+    const next = await chooseEmbeddingModel(ctx, current, await embeddings.run((worker) => worker.cudaUnavailable(), signal));
     if (!next) return;
     const rebuild = !!current && current.model !== next.model;
     const confirm = rebuild
       ? "Existing embeddings will be regenerated. Coordinate other Pi sessions before continuing. The old model stays active if the rebuild fails."
       : `Download ${next.model} (${next.size}) if needed and initialize local storage?`;
     if (!await ctx.ui.confirm(rebuild ? "Rebuild the memory index?" : current ? "Verify Smart Mem model?" : "Initialize Smart Mem?", confirm)) return;
-    await progress(ctx, rebuild ? "Rebuilding Smart Mem index" : "Setting up Smart Mem", (report) => embeddings.run(async (worker) => {
+    const title = rebuild ? "Rebuilding Smart Mem index" : "Setting up Smart Mem";
+    const run = (report: Progress, signal: AbortSignal) => embeddings.run(async (worker) => {
+      void log.write("setup.start", { model: next.model, rebuild });
       if ((await readActivePreset())?.model !== current?.model) throw new Error("Smart Mem model changed in another session. Reopen setup and retry.");
       const device = embeddingDevice(next, (await file.read()).device);
       const space = { model: next.model, dimensions: next.dimensions };
@@ -184,13 +197,24 @@ export default function smartMemory(pi: ExtensionAPI): void {
           report(`Regenerated ${++embedded} embeddings`);
           return embedding;
         });
-      } else if (!current) await store.initialize(space);
+      } else if (!current) await store.initialize(space, signal);
+      signal.throwIfAborted();
       if (!activePreset) await bindProject(ctx);
+      signal.throwIfAborted();
       activePreset = next;
       panel.setActive(true);
       await refreshCounts(ctx);
-      notify(ctx, `Smart Mem ready: ${next.model} on ${device.toUpperCase()}`);
-    }));
+      if (!signal.aborted) notify(ctx, `Smart Mem ready: ${next.model} on ${device.toUpperCase()}`);
+    }, signal);
+    return { title, run };
+  }
+
+  async function setup(ctx: ExtensionCommandContext) {
+    const current = await readActivePreset();
+    return runManualJob(ctx, ctx.mode === "tui" && !current, async (signal) => {
+      const setup = await prepareSetup(ctx, current, signal);
+      return setup && { kind: "setup", ...setup };
+    });
   }
 
   async function setDevice(ctx: ExtensionContext, device: Device) {
@@ -473,7 +497,8 @@ export default function smartMemory(pi: ExtensionAPI): void {
   pi.on("agent_settled", async (_event, ctx) => {
     if (!activePreset) return;
     try {
-      await indexCurrent(ctx);
+      if (deferredImportIndex) deferredImportIndex.pending = true;
+      else await indexCurrent(ctx);
       const settings = await file.read();
       if (settings.autoLink) {
         let activity: Activity | undefined;
@@ -521,30 +546,76 @@ export default function smartMemory(pi: ExtensionAPI): void {
     },
   });
   registerCommand(commands.migrateHermes, {
-    description: "Import all pi-hermes-memory data (use --force to replace existing Smart Mem data)",
+    description: "Import all pi-hermes-memory data (use force to replace existing Smart Mem data)",
     handler: async (args, ctx) => {
-      await ctx.waitForIdle();
-      try {
-        const flag = args.trim();
-        if (flag && flag !== "--force") throw new Error(`Use /${commands.migrateHermes} [--force]`);
-        const force = flag === "--force";
-        const source = await readHermesSource(getAgentDir(), ctx.cwd);
-        if (!activePreset && ctx.hasUI) await setup(ctx);
-        getStore();
-        if (force) ctx.ui.notify("Replacing Smart Mem database contents: existing memories, links, skills, pins, and transcript search index will be removed. Hermes files will not change.", "warning");
-        const result = await progress(ctx, "Migrating Hermes", (log) => migrateHermes({
-          source, dbPath, force, embed: (text) => embed(text, false, ctx.signal), progress: log,
-        }));
-        await bindProject(ctx);
-        await refreshCounts(ctx);
-        const summary = `Imported ${source.memories.length} memories, ${source.skills.length} skills, and ${source.pins.length} pins across global scope and ${result.projects} projects`;
-        const unmatched = result.unmatchedProjects.length
-          ? `Imported projects without a matching folder:\n${result.unmatchedProjects.map(({ name, id }) => `${name}: ${id}`).join("\n")}` : undefined;
-        if (hasPanel(ctx) && unmatched) notify(ctx, `${summary} · ${result.unmatchedProjects.length} unmatched`, "warning", unmatched);
-        else notify(ctx, summary);
-        // The complete ID list must remain available even when panel details are truncated.
-        if (unmatched) ctx.ui.notify(unmatched, "warning");
-      } catch (error) { reportError(ctx, error); }
+      const argument = args.trim();
+      const noticeMs = 60_000;
+      if (argument && argument !== "force") { reportError(ctx, new Error(`Use /${commands.migrateHermes} [force]`), noticeMs); return; }
+      const force = argument === "force";
+      const background = ctx.mode === "tui" && !force;
+      await runManualJob(ctx, background, async (signal) => {
+        const readSource = () => readHermesSource(getAgentDir(), ctx.cwd);
+        // Verify that there is something to import before asking to set up.
+        const sourceForSetup = !activePreset ? await readSource() : undefined;
+        const needsSetup = !activePreset && ctx.hasUI;
+        if (needsSetup && background) await ctx.waitForIdle();
+        const firstSetup = needsSetup ? await prepareSetup(ctx, await readActivePreset(), signal) : undefined;
+        if (!firstSetup) getStore();
+        const title = "Migrating Hermes";
+        return {
+          kind: "migrate-hermes", title,
+          run: async (report, signal) => {
+            const deferred = background ? { pending: false } : undefined;
+            if (deferred) {
+              deferredImportIndex = deferred;
+              void log.write("operation.start", { title });
+            }
+            try {
+              if (firstSetup) {
+                await firstSetup.run((message) => report(`Setting up · ${message}`), signal);
+                signal.throwIfAborted();
+              }
+              if (force) {
+                const warning = "Replacing Smart Mem database contents: existing memories, links, skills, pins, and transcript search index will be removed. Hermes files will not change.";
+                notify(ctx, warning, "warning", warning, noticeMs);
+              }
+              const source = sourceForSetup ?? await readSource();
+              const result = await migrateHermes({ source, dbPath, force, signal, embed: (text) => embed(text, false, signal), progress: (message) => {
+                if (background) void log.write("operation.progress", { title, message });
+                report(message);
+              } });
+              return { source, result };
+            } finally {
+              if (deferred) {
+                try {
+                  while (deferred.pending && !signal.aborted) {
+                    deferred.pending = false;
+                    await indexCurrent(ctx);
+                  }
+                } catch (error) { reportError(ctx, error, noticeMs); }
+                finally { deferredImportIndex = undefined; }
+              }
+            }
+          },
+          complete: async ({ source, result }, signal) => {
+            await bindProject(ctx);
+            if (signal.aborted) return;
+            await refreshCounts(ctx);
+            if (signal.aborted) return;
+            const summary = `Imported ${source.memories.length} memories, ${source.skills.length} skills, and ${source.pins.length} pins across global scope and ${result.projects} projects`;
+            const unmatched = result.unmatchedProjects.length
+              ? `Imported projects without a matching folder:\n${result.unmatchedProjects.map(({ name, id }) => `${name}: ${id}`).join("\n")}` : undefined;
+            if (hasPanel(ctx) && unmatched) {
+              // The timed panel can truncate large lists. Preserve every ID in the log.
+              await Promise.all(result.unmatchedProjects.map((pair) => log.write("migration.unmatched_project", pair, "warning")));
+              if (!signal.aborted) notify(ctx, `${summary} · ${result.unmatchedProjects.length} unmatched (see smart-mem.log)`, "warning", unmatched, noticeMs);
+            } else {
+              notify(ctx, summary, "info", undefined, noticeMs);
+              if (unmatched) ctx.ui.notify(unmatched, "warning");
+            }
+          },
+        };
+      }, noticeMs);
     },
   });
   registerCommand(commands.inject, {
@@ -564,51 +635,75 @@ export default function smartMemory(pi: ExtensionAPI): void {
     kind: string; title: string; scopes: Scope[]; summary: (changes: number) => string; refresh?: boolean;
     run: (report: Progress, signal: AbortSignal) => Promise<MaintenanceResult>;
   };
+  type ManualWork<T> = {
+    kind: string; title: string;
+    run: (report: Progress, signal: AbortSignal) => Promise<T>;
+    complete?: (outcome: T, signal: AbortSignal, activity?: Activity) => void | Promise<void>;
+  };
+  async function runManualJob<T>(ctx: ExtensionCommandContext, background: boolean, prepare: (signal: AbortSignal) => ManualWork<T> | undefined | Promise<ManualWork<T> | undefined>, noticeMs?: number): Promise<boolean> {
+    if (!background) await ctx.waitForIdle();
+    if (manualMaintenance) {
+      notify(ctx, "Smart Mem maintenance is already running in this session", "warning");
+      return false;
+    }
+    const controller = new AbortController();
+    const foregroundSignal = background ? undefined : ctx.signal;
+    const signal = foregroundSignal ? AbortSignal.any([controller.signal, foregroundSignal]) : controller.signal;
+    manualMaintenance = controller;
+    const finish = () => { if (manualMaintenance === controller) manualMaintenance = undefined; };
+    try {
+      const work = await prepare(signal);
+      if (!work) { finish(); return false; }
+      const { kind, title, run, complete } = work;
+      signal.throwIfAborted();
+      const activity = background ? begin(ctx, title) : undefined;
+      if (!activity) {
+        try {
+          const outcome = await progress(ctx, title, (report) => run(report, signal));
+          if (!signal.aborted) await complete?.(outcome, signal);
+        } finally { finish(); }
+        return false;
+      }
+      // Keep the command handler out of Pi's input loop once work starts.
+      void (async () => {
+        try {
+          const outcome = await run(activity.update, signal);
+          if (!signal.aborted) await complete?.(outcome, signal, activity);
+        } catch (error) {
+          if (!signal.aborted) {
+            void log.write("maintenance.command_error", { kind, error: String(error) }, "error");
+            activity.finish(`${title} · Failed`, "error", String(error), noticeMs);
+          }
+        } finally { activity.clear(); finish(); }
+      })().catch((error) => { if (!signal.aborted) reportError(ctx, error, noticeMs); });
+      return true;
+    } catch (error) {
+      finish();
+      if (!signal.aborted) reportError(ctx, error, noticeMs);
+      return false;
+    }
+  }
+
   function registerMaintenanceCommand(command: string, description: string, prepare: (args: string, ctx: ExtensionCommandContext) => Job) {
     registerCommand(command, { description, handler: async (args, ctx) => {
-      const background = ctx.mode === "tui";
-      if (!background) await ctx.waitForIdle();
-      if (manualMaintenance) {
-        notify(ctx, "Smart Mem maintenance is already running in this session", "warning");
-        return;
-      }
-      try {
+      await runManualJob(ctx, ctx.mode === "tui", () => {
         const { kind, title, scopes, summary, run, refresh } = prepare(args, ctx);
-        const controller = new AbortController();
-        const foregroundSignal = background ? undefined : ctx.signal;
-        const signal = foregroundSignal ? AbortSignal.any([controller.signal, foregroundSignal]) : controller.signal;
-        const result = ({ changes, skipped }: MaintenanceResult) => summary(changes) + skipSummary(skipped);
-        const activity = begin(ctx, title);
-        manualMaintenance = controller;
-        const finish = () => { if (manualMaintenance === controller) manualMaintenance = undefined; };
-        if (activity) {
-          // Keep the command handler out of Pi's input loop once work starts.
-          void (async () => {
-            try {
-              const outcome = await run(activity.update, signal);
-              if (!signal.aborted && refresh && outcome.changes) await refreshCounts(ctx);
-              if (!signal.aborted) activity.finish(result(outcome), "info", `Scope: ${scopes.join(" and ")}${outcome.skipped ? "\nSee smart-mem.log for skipped notes." : ""}`);
-            } catch (error) {
-              if (!signal.aborted) {
-                void log.write("maintenance.command_error", { kind, error: String(error) }, "error");
-                activity.finish(`${title} · Failed`, "error", String(error));
-              }
-            } finally { activity.clear(); finish(); }
-          })().catch((error) => { if (!signal.aborted) reportError(ctx, error); });
-        } else {
-          try {
-            const changes = await progress(ctx, title, (report) => run(report, signal));
-            if (!signal.aborted) notify(ctx, result(changes));
-          } finally { finish(); }
-        }
-      } catch (error) { reportError(ctx, error); }
+        return { kind, title, run, complete: async (outcome, signal, activity) => {
+          const result = summary(outcome.changes) + skipSummary(outcome.skipped);
+          if (activity) {
+            if (refresh && outcome.changes) await refreshCounts(ctx);
+            if (!signal.aborted) activity.finish(result, "info", `Scope: ${scopes.join(" and ")}${outcome.skipped ? "\nSee smart-mem.log for skipped notes." : ""}`);
+          } else notify(ctx, result);
+        } };
+      });
     } });
   }
 
   for (const [kind, command] of [["link", commands.link], ["consolidate", commands.consolidate]] as const) {
     const link = kind === "link";
-    registerMaintenanceCommand(command, link ? "Build related-memory links" : "Merge overlapping saved memories and shorten notes", (args, ctx) => {
-      const scopes = scopedMaintenance(project, args);
+    registerMaintenanceCommand(command, link ? "Build related-memory links" :
+      "Consolidate unchecked project memories. Options: global (unchecked in both scopes), full (all project), global full (all in both scopes)", (args, ctx) => {
+      const { scopes, full } = link ? { scopes: scopedMaintenance(project, args), full: false } : consolidationOptions(project, args);
       const target = getStore();
       const messages = link ? withActiveContext(projected(ctx)) : [];
       const systemPrompt = link ? ctx.getSystemPrompt() : "";
@@ -616,7 +711,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
       return { kind, scopes, title: link ? "Building memory links" : "Consolidating memories", refresh: !link,
         summary: (changes) => link ? `Created ${changes} memory links` : `Updated ${changes} saved memories`,
         run: async (report, signal) => runMaintenance({
-          kind, scopes, ctx: modelContext, store: target, settings: await file.read(), messages,
+          kind, scopes, full, ctx: modelContext, store: target, settings: await file.read(), messages,
           embed: (text, signal) => embed(text, false, signal), progress: report, signal,
         }),
       };
@@ -630,7 +725,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
     const batch = { kind, scopes: scopes.join(","), model: model.model?.id };
     return { kind, title, scopes, summary, refresh, run: async (report, signal) => {
       void log.write("maintenance.start", batch);
-      const result = await action({ ctx: model, store: target, scopes, signal, settings: await file.read(), progress: (message) => {
+      const result = await action({ ctx: model, store: target, scopes, signal, settings: await file.read(), diagnostics: log, progress: (message) => {
         void log.write("maintenance.progress", { ...batch, message });
         report(message);
       }, onFailure: (scope, ids, attempt, reason) => {

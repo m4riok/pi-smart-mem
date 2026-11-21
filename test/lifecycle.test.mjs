@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { createServer } from "node:net";
+import { createInterface } from "node:readline";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,13 +9,16 @@ import { test } from "node:test";
 import { getCurrentSystemPrompt, getCurrentTools, fauxProvider, fauxAssistantMessage, fauxToolCall, contentText } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Archive } from "../src/archive.ts";
+import { withDatabase } from "../src/database.ts";
 import { models } from "../src/embeddings.ts";
+import { openSocketDirectory } from "../src/embedding-protocol.ts";
 import { MemoryStore } from "../src/memory-store.ts";
+import { resolveProject } from "../src/project.ts";
 import { SettingsFile } from "../src/settings.ts";
 
 const hermesNames = ["memory_add", "memory_replace", "memory_remove", "session_search", "memory_search"];
 
-async function fixture(t, { child = false, setup = false, hermes = false, mode = "rpc", setWidget = () => {}, select } = {}) {
+async function fixture(t, { child = false, setup = false, empty = false, hermes = false, mode = "rpc", setWidget = () => {}, select, custom, confirm = false } = {}) {
   const cwd = await mkdtemp(join(tmpdir(), "smart-mem-pi-"));
   const agentDir = join(cwd, "agent");
   const directory = join(agentDir, "pi-smart-mem");
@@ -43,8 +49,10 @@ async function fixture(t, { child = false, setup = false, hermes = false, mode =
   let note;
   if (!setup) {
     await store.initialize({ model, dimensions });
-    note = await store.add({ scope: "global", kind: "preference", text: "Use exit status to verify tests ran" }, { model, values: Array.from({ length: dimensions }, (_, i) => i === 0 ? 1 : 0) });
-    await archive.pin("global", "Standing pin fixture");
+    if (!empty) {
+      note = await store.add({ scope: "global", kind: "preference", text: "Use exit status to verify tests ran" }, { model, values: Array.from({ length: dimensions }, (_, i) => i === 0 ? 1 : 0) });
+      await archive.pin("global", "Standing pin fixture");
+    }
   }
   await new SettingsFile(directory).update({ initialMessages: 6, periodicTurns: 3, prompts: { recall: "Recall prompt fixture", correction: "Correction task fixture", explicit: "Explicit task fixture", periodic: "Periodic task fixture", injection: "Injection task fixture" } });
   const faux = fauxProvider({ provider: "smart-mem-fixture", tokensPerSecond: 100000 });
@@ -75,10 +83,41 @@ async function fixture(t, { child = false, setup = false, hermes = false, mode =
       dialogs.push(title);
       return options[0];
     }),
-    confirm: async (title) => { dialogs.push(title); return false; },
+    custom,
+    confirm: async (title) => { dialogs.push(title); return confirm; },
   };
   await session.bindExtensions({ mode, uiContext: ui, onError: (error) => errors.push(error) });
   return { session, note, archive, faux, alerts, errors, sessionManager, store, directory, dialogs, cwd };
+}
+
+async function pausedEmbeddingWorker(directory) {
+  const workerDirectory = join(directory, "embedding-worker");
+  await mkdir(workerDirectory, { recursive: true });
+  const endpoint = await openSocketDirectory(workerDirectory);
+  const started = Promise.withResolvers();
+  const resumed = Promise.withResolvers();
+  let client;
+  const server = createServer((socket) => {
+    client = socket;
+    const reply = (data) => { if (!socket.destroyed) socket.write(JSON.stringify(data) + "\n"); };
+    reply({ kind: "ready" });
+    createInterface({ input: socket }).on("line", async (line) => {
+      const request = JSON.parse(line);
+      if (request.kind === "probe") { reply({ kind: "probe" }); return; }
+      started.resolve({ request, closed: once(socket, "close") });
+      if (request.download) reply({ kind: "progress", message: "Downloading fixture model" });
+      await resumed.promise;
+      const { model, dimensions } = models[0];
+      reply({ kind: "embedding", embedding: { model, values: Array.from({ length: dimensions }, (_, i) => Number(i === 0)) } });
+    });
+  });
+  await once(server.listen(endpoint.path), "listening");
+  return { started: started.promise, resume: resumed.resolve, close: async () => {
+    resumed.resolve();
+    client?.destroy();
+    await new Promise((resolve) => server.close(resolve));
+    await endpoint.close();
+  } };
 }
 
 const text = (messages) => messages.filter((m) => m.role === "user").map((m) => contentText(m.content)).join("\n");
@@ -121,9 +160,11 @@ test("Hermes migration command refuses existing data unless forced and warns bef
   await mkdir(source);
   await writeFile(join(source, "STANDING.md"), "- Imported standing instruction\n");
   await session.prompt("/psm-migrate-hermes");
-  assert.ok(alerts.some(([message, level]) => level === "error" && /--force/.test(message)));
-  assert.deepEqual(await store.read(note.id), note);
+  assert.ok(alerts.some(([message, level]) => level === "error" && message.includes("/psm-migrate-hermes force")));
   await session.prompt("/psm-migrate-hermes --force");
+  assert.ok(alerts.some(([message, level]) => level === "error" && message.includes("Use /psm-migrate-hermes [force]")));
+  assert.deepEqual(await store.read(note.id), note);
+  await session.prompt("/psm-migrate-hermes force");
   const warning = alerts.findIndex(([message, level]) => level === "warning" && /Replacing Smart Mem database contents/.test(message));
   const success = alerts.findIndex(([message, level]) => level === "info" && /Imported 0 memories, 0 skills, and 1 pins/.test(message));
   assert.ok(warning >= 0 && success > warning);
@@ -133,6 +174,100 @@ test("Hermes migration command refuses existing data unless forced and warns bef
   assert.equal(faux.state.callCount, 0);
   assert.deepEqual(errors, []);
 });
+
+for (const reload of [false, true]) {
+  test(`interactive Hermes import ${reload ? "cancels on reload" : "allows chat and shows a 60-second unmatched notice"}`, { timeout: 10_000 }, async (t) => {
+    let panel;
+    const { session, faux, store, archive, directory, errors, alerts } = await fixture(t, { mode: "tui", empty: true, setWidget: (_key, build) => {
+      panel = build?.({ requestRender() {} }, { fg: (_color, text) => text });
+    } });
+    const source = join(directory, "..", "pi-hermes-memory");
+    const missing = join(directory, "..", "projects-memory", "missing-project");
+    await mkdir(source);
+    await mkdir(missing, { recursive: true });
+    await writeFile(join(source, "MEMORY.md"), "A Hermes fixture note");
+    await writeFile(join(missing, "MEMORY.md"), "A note from an unmatched project");
+    const noticeTimer = Promise.withResolvers();
+    const set = globalThis.setTimeout;
+    t.mock.method(globalThis, "setTimeout", (callback, ms, ...args) => {
+      if (ms === 60_000) noticeTimer.resolve(() => callback(...args));
+      return set(callback, ms, ...args);
+    });
+    const worker = await pausedEmbeddingWorker(directory);
+    try {
+      await session.prompt("/psm-migrate-hermes");
+      const { closed } = await worker.started;
+      if (reload) {
+        await session.reload();
+        await closed;
+        assert.deepEqual(await store.list("global"), []);
+      } else {
+        faux.setResponses([fauxAssistantMessage("Chat worked during migration")]);
+        await session.prompt("migrationchatfixture");
+        assert.equal(faux.state.callCount, 1);
+        assert.equal(await store.hasStoredData(), false);
+        worker.resume();
+        const expireNotice = await noticeTimer.promise;
+        assert.match(panel.render(180).join("\n"), /Imported 2 memories.*1 unmatched/);
+        assert.ok(!alerts.some(([message]) => message.includes("missing-project:")));
+        const log = await readFile(join(directory, "smart-mem.log"), "utf8");
+        const unmatched = log.trim().split("\n").map(JSON.parse).find(({ event }) => event === "migration.unmatched_project");
+        assert.equal(unmatched.name, "missing-project");
+        assert.match(unmatched.id, /^[\da-f-]{36}$/);
+        expireNotice();
+        assert.doesNotMatch(panel.render(180).join("\n"), /Imported 2 memories/);
+        assert.deepEqual((await store.list("global")).map(({ text }) => text), ["A Hermes fixture note"]);
+        assert.ok((await archive.searchTranscripts("migrationchatfixture")).some(({ text }) => text === "migrationchatfixture"));
+      }
+      assert.deepEqual(errors, []);
+    } finally { await worker.close(); }
+  });
+}
+
+for (const command of ["psm-setup", "psm-settings", "psm-migrate-hermes"]) {
+  test(`first-time setup from /${command} lets Pi chat during the model download`, { timeout: 10_000 }, async (t) => {
+    const importing = command === "psm-migrate-hermes";
+    const fromSettings = command === "psm-settings";
+    const menuChoices = fromSettings ? [0, models[0]] : [models[0]];
+    const completed = Promise.withResolvers();
+    const downloading = Promise.withResolvers();
+    let customCalls = 0;
+    const { session, directory, dialogs, faux, store, errors } = await fixture(t, { setup: true, mode: "tui", confirm: true,
+      custom: async () => menuChoices[customCalls++],
+      setWidget: (_key, build) => {
+        if (!build) return;
+        const panel = build({ requestRender() {
+          const visible = panel.render(180).join("\n");
+          if (visible.includes("Downloading fixture model")) downloading.resolve();
+          if (visible.includes(importing ? "Imported 1 memories" : "Smart Mem ready:")) completed.resolve();
+        } }, { fg: (_color, text) => text });
+      },
+    });
+    if (importing) {
+      const source = join(directory, "..", "pi-hermes-memory");
+      await mkdir(source);
+      await writeFile(join(source, "MEMORY.md"), "First-time import fixture");
+    }
+    const worker = await pausedEmbeddingWorker(directory);
+    try {
+      await session.prompt(`/${command}`);
+      assert.equal(customCalls, menuChoices.length);
+      assert.deepEqual(dialogs, ["Initialize Smart Mem?"]);
+      const { request } = await worker.started;
+      assert.equal(request.download, true);
+      await downloading.promise;
+      await assert.rejects(stat(join(directory, "db")), { code: "ENOENT" });
+      faux.setResponses([fauxAssistantMessage("Chat worked while the model downloaded")]);
+      await session.prompt("Can you respond during setup?");
+      assert.equal(faux.state.callCount, 1);
+      worker.resume();
+      await completed.promise;
+      assert.equal((await store.embeddingSpace()).model, models[0].model);
+      assert.deepEqual((await store.list("global")).map(({ text }) => text), importing ? ["First-time import fixture"] : []);
+      assert.deepEqual(errors, []);
+    } finally { await worker.close(); }
+  });
+}
 
 test("Pi runs user-triggered and periodic reviews and adds independent, repeatable injections", async (t) => {
   const { session, note, faux, alerts, errors, sessionManager, archive, store, directory } = await fixture(t);
@@ -246,7 +381,7 @@ test("interactive maintenance reports progress and results while normal chat rem
     const widget = build({ requestRender: paint }, { fg: (_color, text) => text });
     paint();
   } });
-  assert.equal(frames.at(-1)[0], "🧠 Memory · Active");
+  assert.equal(frames.at(-1)[0], "🧠 ━━━━  Active");
   const judging = Promise.withResolvers();
   const decision = Promise.withResolvers();
   t.after(() => decision.resolve(fauxAssistantMessage("No decision")));
@@ -257,12 +392,12 @@ test("interactive maintenance reports progress and results while normal chat rem
     },
     (ctx) => {
       assert.match(text(ctx.messages), /Background work should not block this prompt/);
-      assert.doesNotMatch(getCurrentSystemPrompt(ctx.messages), /Shorten the source note or merge/);
+      assert.doesNotMatch(getCurrentSystemPrompt(ctx.messages), /Leave the source unchanged by default/);
       return fauxAssistantMessage("Normal response while maintenance is running");
     },
   ]);
   await session.prompt("/psm-consolidate global");
-  assert.match(await judging.promise, /Shorten the source note or merge/);
+  assert.match(await judging.promise, /Leave the source unchanged by default/);
   assert.ok(frames.at(-1).some((line) => line.includes("Consolidating global memories: 1/1")));
   await session.prompt("/psm-link global");
   assert.ok(frames.at(-1).some((line) => line.includes("maintenance is already running")));
@@ -271,7 +406,7 @@ test("interactive maintenance reports progress and results while normal chat rem
   decision.resolve(fauxAssistantMessage(fauxToolCall("psm_consolidate_note", { ids: [] })));
   await finished.promise;
   assert.equal(registrations, 1);
-  assert.ok(frames.at(-1)[0].startsWith("🧠 Memory · Active"));
+  assert.ok(frames.at(-1)[0].startsWith("🧠 ━━━━  Active"));
   assert.deepEqual(errors, []);
 });
 
@@ -281,7 +416,7 @@ test("interactive Memory panel separates scoped counts and refreshes after write
     if (key === "smart-mem") panel = build?.({ requestRender() {} }, { fg: (_color, text) => text });
   } });
   const counts = (width = 100) => panel.render(width).slice(1).join("\n");
-  assert.equal(panel.render(100)[0], "🧠 Memory · Active");
+  assert.equal(panel.render(100)[0], "🧠 ━━━━  Active");
   assert.match(counts(), /Project: 0 mem · 0 skills · 0 pins  │  Global: 1 mem · 0 skills · 1 pins/);
   await session.prompt("/psm-pin Preserve the fixture");
   assert.match(counts(45), /Project: 0 mem · 0 skills · 1 pins\n  Global: 1 mem · 0 skills · 1 pins/);
@@ -344,7 +479,7 @@ test("reloading Pi cancels background linking and replaces its old panel",  { ti
   await session.reload();
   assert.equal(signal.aborted, true);
   assert.notEqual(rendered, previous);
-  assert.equal(rendered.render(100)[0], "🧠 Memory · Active");
+  assert.equal(rendered.render(100)[0], "🧠 ━━━━  Active");
   assert.ok(!rendered.render(100).some((line) => line.includes("Linking global memories")));
   decision.resolve();
   assert.deepEqual(await store.related(note.id), []);
@@ -388,6 +523,94 @@ for (const kind of ["link", "consolidate"]) test(`${kind} retries an overloaded 
   assert.ok(events.some(({ event, skipped }) => event === "maintenance.finish" && skipped === 1));
   assert.ok(!raw.includes("Private fixture body"));
   assert.deepEqual(errors, []);
+});
+
+test("incremental consolidation tracks checked text, retains older candidates, and supports both full modes", { timeout: 20_000 }, async (t) => {
+  const { session, faux, store, directory, cwd, errors } = await fixture(t, { empty: true });
+  const path = join(directory, "db");
+  const project = new MemoryStore(await resolveProject(cwd, path), path);
+  const { model, dimensions } = models[0];
+  const vector = { model, values: [1, ...Array(dimensions - 1).fill(0)] };
+  // Exercise a configured profile from before the consolidation field existed.
+  await withDatabase(path, false, (db) => db.query("REMOVE FIELD consolidated ON memory").collect());
+  const old = await project.add({ scope: "project", kind: "note", text: "Older project note" }, vector);
+  const global = await store.add({ scope: "global", kind: "note", text: "Global note" }, vector);
+  const command = session.extensionRunner.getRegisteredCommands().find(({ name }) => name === "psm-consolidate");
+  assert.match(command.description, /global.*full.*global full/);
+  const unchanged = { ids: [] };
+  const run = async (args, ids, decide = () => unchanged) => {
+    const inputs = [];
+    const start = faux.state.callCount;
+    faux.setResponses(ids.map(() => ({ messages }) => {
+      const input = JSON.parse(text(messages));
+      inputs.push(input);
+      const decision = decide(input);
+      return decision ? fauxAssistantMessage(fauxToolCall("psm_consolidate_note", decision)) : fauxAssistantMessage("No tool decision");
+    }));
+    await session.prompt(`/psm-consolidate${args ? ` ${args}` : ""}`);
+    assert.deepEqual(inputs.map(({ source }) => source.id), ids);
+    assert.equal(faux.state.callCount - start, ids.length);
+    return inputs;
+  };
+  await run("", [old.id]);
+  await session.reload();
+  await run("", []);
+  await run("global", [global.id]);
+  const fresh = await project.add({ scope: "project", kind: "note", text: "New related project note" }, vector);
+  const combined = "New and older project notes combined";
+  const worker = await pausedEmbeddingWorker(directory);
+  try {
+    worker.resume();
+    const [input] = await run("", [fresh.id], () => ({ ids: [old.id], text: combined }));
+    assert.deepEqual(input.candidates.map(({ id }) => id), [old.id]);
+    assert.equal(await project.read(old.id), undefined);
+    assert.equal((await project.read(fresh.id)).text, combined);
+    await run("global", []);
+    await run("full", [fresh.id, fresh.id], () => undefined);
+    await run("", [fresh.id]);
+    await project.replace(fresh.id, "Edited project note", vector);
+    await run("", [fresh.id]);
+    await run("global full", [fresh.id, global.id]);
+    await run("global", []);
+    assert.deepEqual(errors, []);
+  } finally { await worker.close(); }
+});
+
+test("consolidation skips standalone rewrites below either savings threshold without retrying", async (t) => {
+  const { session, faux, store, alerts, errors, directory } = await fixture(t, { empty: true });
+  const { model, dimensions } = models[0];
+  const vector = { model, values: [1, ...Array(dimensions - 1).fill(0)] };
+  const cases = [
+    { body: "A".repeat(200), saved: 29, accepted: false },
+    { body: "B".repeat(601), saved: 30, accepted: false },
+    { body: "C".repeat(600), saved: 30, accepted: true },
+    { body: "D".repeat(100), saved: -5, accepted: false },
+  ];
+  const notes = new Map();
+  for (const example of cases) {
+    const note = await store.add({ scope: "global", kind: "note", text: example.body }, vector);
+    notes.set(note.id, { ...example, note });
+  }
+  const ordered = await store.list("global");
+  faux.setResponses(ordered.map(({ id }) => {
+    const { body, saved } = notes.get(id);
+    const replacement = saved > 0 ? body.slice(0, -saved) : body + ".".repeat(-saved);
+    return fauxAssistantMessage(fauxToolCall("psm_consolidate_note", { ids: [], text: replacement }));
+  }));
+  const worker = await pausedEmbeddingWorker(directory);
+  try {
+    worker.resume();
+    await session.prompt("/psm-consolidate global");
+    assert.equal(faux.state.callCount, cases.length);
+    assert.ok(alerts.some(([message, level]) => level === "info" && message === "Updated 1 saved memories"));
+    for (const { note, body, saved, accepted } of notes.values()) {
+      const current = await store.read(note.id);
+      if (accepted) assert.equal(current.text, body.slice(0, -saved));
+      else assert.deepEqual(current, note);
+    }
+    assert.deepEqual(await store.list("global", "unconsolidated"), []);
+    assert.deepEqual(errors, []);
+  } finally { await worker.close(); }
 });
 
 test("consolidation retries a prose decision once, then skips unanswered notes and continues", async (t) => {
@@ -477,7 +700,7 @@ test("Debug logging is opt-in and records untruncated consolidation input, repli
     capture(fauxAssistantMessage(prose)), capture(unchanged),
     capture(fauxAssistantMessage(fauxToolCall("psm_consolidate_note", invalid))), capture(unchanged),
   ]);
-  await session.prompt("/psm-consolidate global");
+  await session.prompt("/psm-consolidate global full");
   const debug = (await readLog()).filter(({ level }) => level === "debug");
   assert.deepEqual(debug.filter(({ event }) => event === "consolidation.request").map(({ input }) => input), inputs);
   assert.ok(inputs.some(({ source, candidates }) => [source, ...candidates].some(({ text }) => text === body)));
@@ -490,8 +713,56 @@ test("Debug logging is opt-in and records untruncated consolidation input, repli
   await session.prompt("/psm-settings");
   assert.equal((await settings.read()).debugLogging, false);
   faux.setResponses([unchanged, unchanged]);
-  await session.prompt("/psm-consolidate global");
+  await session.prompt("/psm-consolidate global full");
   assert.equal((await readLog()).filter(({ level }) => level === "debug").length, debug.length);
+  assert.deepEqual(errors, []);
+});
+
+test("manual linking, reclassification, and both cleanup passes trace decisions only in debug mode", async (t) => {
+  const { session, store, note, directory, faux, errors } = await fixture(t);
+  const { model, dimensions } = models[0];
+  const body = "Private maintenance note " + "x".repeat(9000);
+  const guidance = "Private maintenance guidance";
+  await store.add({ scope: "global", kind: "note", text: body }, { model, values: [1, ...Array(dimensions - 1).fill(0)] });
+  await writeFile(join(directory, "..", "SYSTEM.md"), guidance);
+  faux.setResponses([fauxAssistantMessage("Ordinary chat response")]);
+  await session.prompt("Private linking conversation");
+  const unchanged = (name) => fauxAssistantMessage(fauxToolCall(name, name.endsWith("_batch") ? { updates: [] } : { ids: [] }));
+  const run = async (debugLogging) => {
+    await new SettingsFile(directory).update({ debugLogging });
+    const malformed = fauxAssistantMessage(fauxToolCall("psm_select_links", { text: "Private invalid decision" }));
+    faux.setResponses([malformed, unchanged("psm_select_links"), unchanged("psm_select_links")]);
+    await session.prompt("/psm-link global");
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("psm_reclassify_batch", { updates: [{ id: note.id, kind: debugLogging ? "guideline" : note.kind }] }))]);
+    await session.prompt("/psm-reclassify global");
+    faux.setResponses([unchanged("psm_cleanup_guidance_batch"), unchanged("psm_cleanup_memory_conflict"), unchanged("psm_cleanup_memory_conflict")]);
+    await session.prompt("/psm-cleanup-conflicts");
+    await session.reload();
+    return (await readFile(join(directory, "smart-mem.log"), "utf8")).trim().split("\n").map(JSON.parse);
+  };
+  const off = await run(false);
+  assert.ok(off.some(({ event }) => event === "maintenance.note_failed"));
+  assert.ok(!off.some(({ level }) => level === "debug"));
+  assert.doesNotMatch(JSON.stringify(off), /Private maintenance note|Private maintenance guidance|Private invalid decision/);
+  const debug = (await run(true)).filter(({ level }) => level === "debug");
+  const link = debug.filter(({ event }) => event.startsWith("linking."));
+  assert.deepEqual(link.filter(({ event }) => event === "linking.request").map(({ attempt }) => attempt), [1, 2, 1]);
+  assert.deepEqual(link.filter(({ event }) => event === "linking.result").map(({ result }) => result), [{ linked: [] }, { linked: [] }]);
+  assert.ok(link.some(({ input }) => input && [input.source, ...input.candidates].some(({ text }) => text === body)));
+  assert.match(JSON.stringify(link), /Private invalid decision/);
+  assert.doesNotMatch(JSON.stringify(link.filter(({ event }) => event === "linking.request")), /Private linking conversation/);
+  const decisions = debug.filter(({ event }) => event.startsWith("maintenance.decision."));
+  const requests = decisions.filter(({ event }) => event.endsWith(".request"));
+  const responses = decisions.filter(({ event }) => event.endsWith(".response"));
+  const results = decisions.filter(({ event }) => event.endsWith(".result"));
+  assert.deepEqual(requests.map(({ tool }) => tool), ["psm_reclassify_batch", "psm_cleanup_guidance_batch", "psm_cleanup_memory_conflict", "psm_cleanup_memory_conflict"]);
+  assert.ok(requests[0].input.notes.some(({ text }) => text === body));
+  assert.ok(requests[1].input.guidance.some(({ text }) => text === guidance));
+  assert.deepEqual(responses.map(({ content }) => content.find(({ type }) => type === "toolCall").name), requests.map(({ tool }) => tool));
+  const key = ({ tool, scope, noteIds, attempt }) => ({ tool, scope, noteIds, attempt });
+  assert.deepEqual(responses.map(key), requests.map(key));
+  assert.deepEqual(results.map(key), requests.map(key));
+  assert.deepEqual(results.map(({ result }) => result.changes), [1, 0, 0, 0]);
   assert.deepEqual(errors, []);
 });
 
