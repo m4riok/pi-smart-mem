@@ -935,7 +935,7 @@ test("manual linking, reclassification, and both cleanup passes trace decisions 
 const evidenceIds = (messages, role, quote) => messages.filter((message) => message.role === role && contentText(message.content).includes(quote))
   .map((message) => contentText(message.content).match(/\[Smart Mem evidence messageId: ([^\]]+)\]/)?.[1]);
 
-test("review boosts original evidence despite a tool echo and counts repeated reports once", async (t) => {
+test("review deduplicates cited evidence but accepts identical corrections for separate mistakes", async (t) => {
   const { session, faux, note, store, errors, directory, sessionManager } = await fixture(t);
   await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
   const correction = "No, use the exit status for this failed setup check.";
@@ -943,7 +943,7 @@ test("review boosts original evidence despite a tool echo and counts repeated re
   const { model, dimensions } = models[0];
   const echo = await store.add({ scope: "global", kind: "note", text: correction }, { model, values: Array.from({ length: dimensions }, (_, i) => Number(i === 0)) });
   const boost = (messageId, evidence) => fauxToolCall("psm_reinforce_memory", { id: note.id, messageId, evidence });
-  let originalId, echoId, repeatedId, distinctId;
+  let originalId, echoId, secondCorrectionId, distinctId;
   faux.setResponses([
     ({ messages }) => {
       assert.ok(!getCurrentTools(messages).some(({ name }) => name === "psm_reinforce_memory"));
@@ -959,10 +959,18 @@ test("review boosts original evidence despite a tool echo and counts repeated re
     fauxAssistantMessage("I checked the exit status."),
     fauxAssistantMessage("That's the same setup check."),
     ({ messages }) => {
-      repeatedId = evidenceIds(messages, "user", correction).at(-1);
-      return fauxAssistantMessage(boost(repeatedId, correction));
+      assert.match(getCurrentSystemPrompt(messages), /A correction trigger alone does not establish a new incident/);
+      return fauxAssistantMessage(boost(originalId, correction));
     },
     fauxAssistantMessage("This report already counted."),
+    fauxAssistantMessage("The next setup check passed because it printed a success banner."),
+    fauxAssistantMessage("I'll check the new run's exit status instead."),
+    ({ messages }) => {
+      assert.match(getCurrentSystemPrompt(messages), /The same wording can count again if it corrects a separate mistake/);
+      secondCorrectionId = evidenceIds(messages, "user", correction).at(-1);
+      return fauxAssistantMessage(boost(secondCorrectionId, correction));
+    },
+    fauxAssistantMessage("Reinforced for a separate mistake."),
     fauxAssistantMessage(evidence),
     ({ messages }) => {
       [distinctId] = evidenceIds(messages, "assistant", evidence);
@@ -976,13 +984,17 @@ test("review boosts original evidence despite a tool echo and counts repeated re
   assert.deepEqual(await store.read(note.id), { ...note, weight: 1 });
   await session.prompt(correction);
   await waitForReviews(sessionManager, 2);
-  assert.ok(repeatedId && repeatedId !== originalId);
   assert.deepEqual(await store.read(note.id), { ...note, weight: 1 });
-  await session.prompt("No, check the other test wrapper too.");
+  await session.prompt("Did the next setup check pass?");
+  await session.prompt(correction);
   await waitForReviews(sessionManager, 3);
-  assert.ok(distinctId && distinctId !== originalId);
+  assert.ok(secondCorrectionId && secondCorrectionId !== originalId);
   assert.deepEqual(await store.read(note.id), { ...note, weight: 2 });
-  assert.deepEqual(rows(sessionManager).map(({ status }) => status), ["Saved · 1", "Skipped", "Saved · 1"]);
+  await session.prompt("No, check the other test wrapper too.");
+  await waitForReviews(sessionManager, 4);
+  assert.ok(distinctId && distinctId !== originalId);
+  assert.deepEqual(await store.read(note.id), { ...note, weight: 3 });
+  assert.deepEqual(rows(sessionManager).map(({ status }) => status), ["Saved · 1", "Skipped", "Saved · 1", "Saved · 1"]);
   assert.deepEqual(errors, []);
 });
 

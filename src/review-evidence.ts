@@ -6,7 +6,6 @@ import { contentText } from "./archive.ts";
 export function reviewEvidence(branch: SessionEntry[], messages: Message[]) {
   type Evidence = { id: string; text: string; incident: string };
   const byMessage = new Map<string, Evidence>();
-  const firstReport = new Map<string, string>();
   const key = (message: Message) => message.role === "toolResult"
     ? `toolResult:${message.toolCallId}:${message.timestamp}`
     : `${message.role}:${message.timestamp}`;
@@ -16,12 +15,7 @@ export function reviewEvidence(branch: SessionEntry[], messages: Message[]) {
     if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") continue;
     const text = contentText(message.content).trim();
     if (!text) continue;
-    let incident = createHash("sha256").update(JSON.stringify([entry.id, message.timestamp])).digest("hex");
-    if (message.role === "user") {
-      // A verbatim repeat remains the same report, even after compaction.
-      incident = firstReport.get(text) ?? incident;
-      firstReport.set(text, incident);
-    }
+    const incident = createHash("sha256").update(JSON.stringify([entry.id, message.timestamp])).digest("hex");
     byMessage.set(key(message), { id: entry.id, text, incident });
   }
   const visible = new Map<string, Evidence>();
