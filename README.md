@@ -8,10 +8,13 @@ Smart Mem tools use the `psm_` prefix (for example, `psm_memory_search` and `psm
 
 ## What Pi remembers and where
 
-| Scope | Memory types | Examples |
-| --- | --- | --- |
-| **Project** | Repository information, workflow decisions, and local failures | Where migrations live, which test command to use here, and a workaround specific to this repo |
-| **Global** | User preferences and workflow failures that apply across projects | Prefer concise updates; verify that a check actually ran instead of relying on its exit code alone |
+| Kind | Meaning |
+| --- | --- |
+| **Guideline** | Clear owner-given standing direction. |
+| **Preference** | A preferred default, not a requirement. |
+| **Note** | Other durable facts, decisions, and lessons. |
+
+Each kind can be project-scoped or global. Existing Smart Mem databases from the earlier category schema are not migrated.
 
 Project notes stay with their project. Global notes are available across projects. Memories are short, durable notes, not copies of chats or large blocks of code. Your current request and standing guidance take precedence. When a project note conflicts with a global default, the project note takes precedence in that project.
 
@@ -73,7 +76,7 @@ Run `/psm-setup` or choose **Embedding model** in `/psm-settings` to check again
 
 ## Migrate from pi-hermes-memory
 
-Close other Pi sessions using Hermes or Smart Mem, then run `/psm-migrate-hermes` in a main Pi session. One run imports global and project memories, skills, and pins. Hermes failures with a saved project tag stay project-scoped; untagged failures stay global. Project folders are matched automatically; the command reports IDs for imported projects it could not match. Hermes files stay unchanged.
+Close other Pi sessions using Hermes or Smart Mem, then run `/psm-migrate-hermes` in a main Pi session. One run imports global and project memories, skills, and pins. `MEMORY.md` entries and failures import as notes; `USER.md` entries import as global preferences. Failures with a saved project tag stay project-scoped; untagged failures stay global. When available, Hermes creation dates initialize Smart Mem's revision timestamp. Project folders are matched automatically; the command reports IDs for imported projects it could not match. Hermes files stay unchanged.
 
 `/psm-migrate-hermes --force` **replaces existing Smart Mem data**, including memories, links, skills, pins, and the transcript index. Without `--force`, migration refuses to replace a populated store. Neither form deletes Pi transcripts; use Smart Mem's transcript backfill to rebuild the index.
 

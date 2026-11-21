@@ -2,14 +2,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Tool } from "@earendil-works/pi-ai";
 import { Type, type Static, type TSchema } from "typebox";
 import type { Archive } from "./archive.ts";
-import type { Draft, Embedding, MemoryStore } from "./memory-store.ts";
+import { memoryKinds, type Embedding, type MemoryStore } from "./memory-store.ts";
 
 const text = Type.String({ minLength: 1 });
 const id = Type.String({ minLength: 1 });
 const scope = Type.Union([Type.Literal("project"), Type.Literal("global")]);
 const limit = Type.Optional(Type.Integer({ minimum: 1, maximum: 50 }));
-const projectCategories = Type.Union([Type.Literal("repository_information"), Type.Literal("workflow_decision"), Type.Literal("local_failure")]);
-const globalCategories = Type.Union([Type.Literal("user_preference"), Type.Literal("global_workflow_failure")]);
+export const memoryKind = Type.Union(memoryKinds.map((value) => Type.Literal(value)));
 export type Outcome = { value: unknown; saved?: boolean };
 export type Operation = Tool & { call: (args: unknown, signal: AbortSignal | undefined) => Promise<Outcome> };
 export function operation<T extends TSchema>(name: string, description: string, parameters: T, call: (args: Static<T>, signal?: AbortSignal) => Promise<Outcome> | Outcome): Operation {
@@ -41,15 +40,14 @@ export const lookupNames = [toolNames.memorySearch, toolNames.memoryRead, toolNa
 export function memoryTools(getStore: () => MemoryStore, getArchive: () => Archive, embed: (text: string, query: boolean, signal?: AbortSignal) => Promise<Embedding>, sessionFile: () => string | undefined): Operation[] {
   const output = async <T>(task: Promise<T>): Promise<Outcome> => ({ value: await task });
   return [
-    operation(toolNames.memorySearch, "Find saved memories by keyword and meaning.", Type.Object({ query: text, limit, scope: Type.Optional(scope), category: Type.Optional(Type.Union([projectCategories, globalCategories])) }), async (args, signal) => {
+    operation(toolNames.memorySearch, "Find saved memories by keyword and meaning.", Type.Object({ query: text, limit, scope: Type.Optional(scope), kind: Type.Optional(memoryKind) }), async (args, signal) => {
       const embedding = await embed(args.query, true, signal);
       const notes = await getStore().search({ ...args, text: args.query, embedding, limit: args.limit ?? 10 });
       return { value: notes.map(({ project: _, ...note }) => ({ ...note, scope: note.scope === "project" ? "Project" : "Global" })) };
     }),
     operation(toolNames.memoryRead, "Read one saved memory by ID.", Type.Object({ id }), ({ id }) => output(getStore().read(id))),
-    operation(toolNames.memoryAdd, "Save a new durable memory to the selected scope and category.", Type.Object({ scope, category: Type.Union([projectCategories, globalCategories]), text }), async (args, signal) => {
-      // MemoryStore validates that the selected category belongs to the requested scope.
-      const value = await getStore().add(args as Draft, await embed(args.text, false, signal), signal);
+    operation(toolNames.memoryAdd, "Save a durable memory: guideline for clear owner-given standing direction, preference for a preferred default, or note for other durable information.", Type.Object({ scope, kind: memoryKind, text }), async (args, signal) => {
+      const value = await getStore().add(args, await embed(args.text, false, signal), signal);
       return { value, saved: true };
     }),
     operation(toolNames.memoryReplace, "Replace the text of a saved memory without changing its scope or links.", Type.Object({ id, text }), async (args, signal) => {

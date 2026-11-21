@@ -4,6 +4,7 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { RecordId } from "surrealdb";
 import { promisify } from "node:util";
 import { Archive } from "../src/archive.ts";
 import { withDatabase } from "../src/database.ts";
@@ -13,8 +14,8 @@ const exec = promisify(execFile);
 const space = { model: "fixture", dimensions: 3 };
 const vector = (...values) => ({ model: space.model, values });
 const query = vector(1, 0, 0);
-const projectNote = (text) => ({ scope: "project", category: "workflow_decision", text });
-const preference = (text) => ({ scope: "global", category: "user_preference", text });
+const projectNote = (text) => ({ scope: "project", kind: "note", text });
+const preference = (text) => ({ scope: "global", kind: "preference", text });
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), "smart-mem-store-"));
@@ -43,9 +44,13 @@ test("explicit initialization and durable scoped CRUD", async (t) => {
   assert.equal(await other.replace(local.id, "Not allowed", query), undefined);
   assert.equal(await other.remove(local.id), false);
   assert.deepEqual(await store.read(local.id), local);
-  assert.deepEqual(await store.replace(local.id, "Use pnpm and run check", query), {
-    ...local, text: "Use pnpm and run check",
-  });
+  assert.equal(local.weight, 0);
+  assert.ok(local.revisedAt > 0);
+  assert.deepEqual(await store.replace(local.id, local.text, query), local);
+  const { revisedAt, ...edited } = await store.replace(local.id, "Use pnpm and run check", query);
+  assert.ok(revisedAt > local.revisedAt);
+  const { revisedAt: originalRevision, ...original } = local;
+  assert.deepEqual(edited, { ...original, text: "Use pnpm and run check" });
   assert.equal(await store.remove(local.id), true);
   assert.equal(await store.read(local.id), undefined);
 });
@@ -58,7 +63,7 @@ test("inventory counts memories, skills and pins without counting unrelated proj
   await store.add(projectNote("Current project"), query);
   await other.add(projectNote("Unrelated project"), query);
   await global.add(preference("Global preference"), query);
-  await global.add({ scope: "global", category: "global_workflow_failure", text: "Global failure" }, query);
+  await global.add({ scope: "global", kind: "note", text: "Global failure" }, query);
   await archive.saveSkill({ ...skill, scope: "project" });
   await archive.saveSkill({ ...skill, scope: "global" });
   await otherArchive.saveSkill({ ...skill, scope: "project" });
@@ -83,7 +88,7 @@ test("search filters before ranking and returns project and global labels", asyn
   const mixed = await store.search({ ...search, limit: 5 });
   assert.deepEqual(new Set(mixed), new Set([both, semantic, lexical, shared]));
   assert.ok(mixed.every(({ id }) => id !== excluded.id));
-  assert.deepEqual(await store.search({ ...search, category: "user_preference" }), [shared]);
+  assert.deepEqual(await store.search({ ...search, kind: "preference" }), [shared]);
   assert.deepEqual(await global.search(search), [shared]);
 });
 
@@ -93,7 +98,7 @@ test("links are one-hop, scoped and retained on edit; related preferences do not
   const neighbor = await store.add(projectNote("JWT generation"), query);
   const wrongRepo = await other.add(projectNote("Another repo's auth"), query);
   const shared = await global.add(preference("Use explicit expiry values"), vector(0.98, 0.2, 0));
-  await global.add({ scope: "global", category: "global_workflow_failure", text: "A test did not run" }, query);
+  await global.add({ scope: "global", kind: "note", text: "A test did not run" }, query);
   assert.deepEqual(await store.relatedGlobalPreferences(first.id, 3), [shared]);
   assert.deepEqual(await other.relatedGlobalPreferences(first.id, 3), []);
   assert.deepEqual(await store.related(first.id), []);
@@ -112,12 +117,15 @@ test("links are one-hop, scoped and retained on edit; related preferences do not
   assert.deepEqual(await store.related(first.id), []);
 });
 
-test("merge redirects incoming and outgoing links and keeps scope and category", async (t) => {
-  const { store, global } = await fixture(t);
+test("merge redirects incoming and outgoing links and keeps scope and kind", async (t) => {
+  const { path, store, global } = await fixture(t);
   const from = await store.add(projectNote("Refer to test procedure"), query);
-  const keep = await store.add(projectNote("Run check"), query);
-  const drop = await store.add({ scope: "project", category: "local_failure", text: "Test command needs database fixture" }, query);
+  const keep = await store.add({ scope: "project", kind: "guideline", text: "Run check" }, query);
+  const drop = await store.add({ scope: "project", kind: "note", text: "Test command needs database fixture" }, query);
   const target = await global.add(preference("Use isolated fixtures"), query);
+  await withDatabase(path, false, (db) => db.query("UPDATE $keep SET weight = 2; UPDATE $drop SET weight = 5;", {
+    keep: new RecordId("memory", keep.id), drop: new RecordId("memory", drop.id),
+  }));
   await store.link(from.id, drop.id);
   await store.link(keep.id, drop.id);
   await store.link(drop.id, target.id);
@@ -125,7 +133,7 @@ test("merge redirects incoming and outgoing links and keeps scope and category",
   const text = "Run check against an isolated database fixture";
   assert.equal(await store.merge(keep, [drop], text, query), true);
   assert.equal(await store.read(drop.id), undefined);
-  assert.deepEqual(await store.related(from.id), [{ ...keep, text }]);
+  assert.deepEqual(await store.related(from.id), [{ ...keep, text, weight: 5 }]);
   assert.deepEqual(await store.related(keep.id), [target]);
   await assert.rejects(store.merge(keep, [target], text, query), /same scope/);
 });
@@ -160,7 +168,7 @@ test("independent processes share the same store under the held lock", async (t)
   const children = Array.from({ length: 4 }, (_, i) => exec(process.execPath, ["--input-type=module", "-e", `
     import { MemoryStore } from ${JSON.stringify(source)};
     const store = new MemoryStore(undefined, process.argv[1]);
-    const saved = await store.add({ scope: "global", category: "user_preference", text: process.argv[2] }, ${JSON.stringify(query)});
+    const saved = await store.add({ scope: "global", kind: "preference", text: process.argv[2] }, ${JSON.stringify(query)});
     console.log(saved.id);
   `, path, `Child ${i}`], { timeout: 15_000 }));
   const results = await Promise.allSettled(children);

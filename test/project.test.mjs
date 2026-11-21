@@ -54,7 +54,7 @@ test("linked worktrees and same-origin clones share memories, pins and skills", 
   const otherId = await resolveProject(other, db);
   assert.notEqual(otherId, id);
 
-  const note = await new MemoryStore(id, db).add({ scope: "project", category: "workflow_decision", text: "Run project fixtures" }, embedding);
+  const note = await new MemoryStore(id, db).add({ scope: "project", kind: "note", text: "Run project fixtures" }, embedding);
   assert.deepEqual(await new MemoryStore(await resolveProject(clone, db), db).read(note.id), note);
   assert.equal(await new MemoryStore(otherId, db).read(note.id), undefined);
   const archive = new Archive(db, id);

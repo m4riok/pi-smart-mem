@@ -67,10 +67,16 @@ test("bulk import preserves Hermes project and global failure attribution, skill
   const archive = new Archive(dbPath, localId);
   const global = await store.list("global");
   assert.deepEqual(global.map(({ text }) => text).sort(), ["Keep notes concise", "Prefer short feedback", "Summarize changes", "Verify the result of a global operation"]);
-  assert.equal(global.find(({ text }) => text.includes("global operation")).category, "global_workflow_failure");
+  assert.deepEqual(Object.fromEntries(global.map(({ text, kind }) => [text, kind])), {
+    "Keep notes concise": "note", "Prefer short feedback": "preference", "Summarize changes": "note", "Verify the result of a global operation": "note",
+  });
+  assert.equal(global.find(({ text }) => text === "Keep notes concise").revisedAt, Date.parse("2026-01-01"));
+  assert.ok(global.find(({ text }) => text === "Summarize changes").revisedAt > Date.parse("2026-01-02"));
+  assert.ok(global.every(({ weight }) => weight === 0));
   const projectNotes = await local.list("project");
   assert.deepEqual(projectNotes.map(({ text }) => text).sort(), ["PROJECT-shop: Check exit status", "Use pnpm"]);
-  assert.equal(projectNotes.find(({ text }) => text.includes("exit status")).category, "local_failure");
+  assert.ok(projectNotes.every(({ kind }) => kind === "note"));
+  assert.equal(projectNotes.find(({ text }) => text.includes("exit status")).revisedAt, Date.parse("2026-01-01"));
   const [top] = await local.search({ text: "pnpm", embedding, limit: 8, scope: "project" });
   assert.equal(top.text, "Use pnpm");
   const failureOnly = new MemoryStore(unmatched.get("failure-only"), dbPath);
@@ -87,8 +93,8 @@ test("bulk import preserves Hermes project and global failure attribution, skill
 
 test("populated store requires force; failed embedding leaves existing data intact", async (t) => {
   const { store, dbPath, migrate, root } = await fixture(t);
-  const old = await store.add({ scope: "global", category: "user_preference", text: "Old saved note" }, embedding);
-  const other = await store.add({ scope: "global", category: "user_preference", text: "Other old note" }, embedding);
+  const old = await store.add({ scope: "global", kind: "preference", text: "Old saved note" }, embedding);
+  const other = await store.add({ scope: "global", kind: "preference", text: "Other old note" }, embedding);
   await store.link(old.id, other.id);
   const archive = new Archive(dbPath);
   const skill = await archive.saveSkill({ scope: "global", name: "Old skill", description: "Old", text: "Old instructions" });

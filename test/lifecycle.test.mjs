@@ -43,7 +43,7 @@ async function fixture(t, { child = false, setup = false, hermes = false, mode =
   let note;
   if (!setup) {
     await store.initialize({ model, dimensions });
-    note = await store.add({ scope: "global", category: "user_preference", text: "Use exit status to verify tests ran" }, { model, values: Array.from({ length: dimensions }, (_, i) => i === 0 ? 1 : 0) });
+    note = await store.add({ scope: "global", kind: "preference", text: "Use exit status to verify tests ran" }, { model, values: Array.from({ length: dimensions }, (_, i) => i === 0 ? 1 : 0) });
     await archive.pin("global", "Standing pin fixture");
   }
   await new SettingsFile(directory).update({ initialMessages: 6, periodicTurns: 3, prompts: { recall: "Recall prompt fixture", correction: "Correction task fixture", explicit: "Explicit task fixture", periodic: "Periodic task fixture", injection: "Injection task fixture" } });
@@ -136,7 +136,7 @@ test("Hermes migration command refuses existing data unless forced and warns bef
 
 test("Pi runs user-triggered and periodic reviews and adds independent, repeatable injections", async (t) => {
   const { session, note, faux, alerts, errors, sessionManager, archive, store, directory } = await fixture(t);
-  const removable = await store.add({ scope: "global", category: "user_preference", text: "Obsolete fixture" }, { model: models[0].model, values: Array.from({ length: models[0].dimensions }, (_, i) => Number(i === 0)) });
+  const removable = await store.add({ scope: "global", kind: "preference", text: "Obsolete fixture" }, { model: models[0].model, values: Array.from({ length: models[0].dimensions }, (_, i) => Number(i === 0)) });
   const seen = [];
   faux.setResponses([
     (ctx) => {
@@ -327,7 +327,7 @@ test("reloading Pi cancels background linking and replaces its old panel",  { ti
   } });
   const { model, dimensions } = models[0];
   const embedding = { model, values: Array.from({ length: dimensions }, (_, i) => i === 0 ? 1 : 0) };
-  await store.add({ scope: "global", category: "user_preference", text: "Check return codes" }, embedding);
+  await store.add({ scope: "global", kind: "preference", text: "Check return codes" }, embedding);
   const judging = Promise.withResolvers();
   const decision = Promise.withResolvers();
   t.after(() => decision.resolve());
@@ -355,7 +355,7 @@ for (const kind of ["link", "consolidate"]) test(`${kind} retries an overloaded 
   const { session, faux, store, alerts, errors, directory } = await fixture(t);
   const { model, dimensions } = models[0];
   const vector = { model, values: [1, ...Array(dimensions - 1).fill(0)] };
-  for (const label of ["A", "B"]) await store.add({ scope: "global", category: "user_preference", text: `Private fixture body ${label}` }, vector);
+  for (const label of ["A", "B"]) await store.add({ scope: "global", kind: "preference", text: `Private fixture body ${label}` }, vector);
   const before = await store.list("global");
   const name = kind === "link" ? "psm_select_links" : "psm_consolidate_note";
   const calls = [];
@@ -398,7 +398,7 @@ test("consolidation retries a prose decision once, then skips unanswered notes a
   const { model, dimensions } = models[0];
   const embedding = { model, values: Array.from({ length: dimensions }, (_, i) => i === 0 ? 1 : 0) };
   for (const text of ["Place integration tests in fixtures", "Run typecheck before release"]) {
-    await store.add({ scope: "global", category: "user_preference", text }, embedding);
+    await store.add({ scope: "global", kind: "preference", text }, embedding);
   }
   const notes = await store.list("global");
   const source = ({ messages }) => {
@@ -451,7 +451,7 @@ test("Debug logging is opt-in and records untruncated consolidation input, repli
   assert.equal((await settings.read()).debugLogging, false);
   const { model, dimensions } = models[0];
   const body = "Private consolidation note " + "x".repeat(9000) + " end of note";
-  await store.add({ scope: "global", category: "user_preference", text: body }, { model, values: [1, ...Array(dimensions - 1).fill(0)] });
+  await store.add({ scope: "global", kind: "preference", text: body }, { model, values: [1, ...Array(dimensions - 1).fill(0)] });
   const readLog = async () => {
     await session.reload();
     return (await readFile(join(directory, "smart-mem.log"), "utf8")).trim().split("\n").map(JSON.parse);
@@ -499,7 +499,7 @@ test("link command and opt-in batches judge stored embeddings with active model"
   const { session, note, faux, directory, store, errors, alerts } = await fixture(t);
   const { model, dimensions } = models[0];
   const embedding = { model, values: Array.from({ length: dimensions }, (_, i) => i === 0 ? 1 : 0) };
-  const second = await store.add({ scope: "global", category: "global_workflow_failure", text: "Verify npm exit status when checks fail" }, embedding);
+  const second = await store.add({ scope: "global", kind: "note", text: "Verify npm exit status when checks fail" }, embedding);
   await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
   const judged = [];
   const judge = (ctx) => {
@@ -516,7 +516,7 @@ test("link command and opt-in batches judge stored embeddings with active model"
   assert.deepEqual(await store.related(second.id), []);
   assert.deepEqual(await store.list("global", true), []);
   await new SettingsFile(directory).update({ autoLink: true, linkThreshold: 1 });
-  const third = await store.add({ scope: "global", category: "user_preference", text: "Run checks after editing" }, embedding);
+  const third = await store.add({ scope: "global", kind: "preference", text: "Run checks after editing" }, embedding);
   faux.setResponses([fauxAssistantMessage("Ordinary answer"), judge]);
   await session.prompt("Turn to trigger background linking");
   assert.deepEqual(judged.slice(2), [third.id]);

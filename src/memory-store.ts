@@ -3,32 +3,26 @@ import { RecordId, type Surreal } from "surrealdb";
 import { DEFAULT_DATABASE_PATH, withDatabase } from "./database.ts";
 import { commands } from "./commands.ts";
 
-const categories = {
-  project: ["repository_information", "workflow_decision", "local_failure"],
-  global: ["user_preference", "global_workflow_failure"],
-} as const;
-
-export type Scope = keyof typeof categories;
+export const memoryKinds = ["guideline", "preference", "note"] as const;
+export type Scope = "project" | "global";
 export type Inventory = { memories: number; skills: number; pins: number };
 export type ScopedInventory = { project?: Inventory; global: Inventory };
-export type Category = (typeof categories)[Scope][number];
+export type MemoryKind = (typeof memoryKinds)[number];
 export type EmbeddingSpace = { model: string; dimensions: number };
 export type Embedding = { model: string; values: readonly number[] };
-export type Memory = { id: string; text: string; category: Category; project?: string; scope: Scope };
-export type Draft = {
-  [S in Scope]: { scope: S; category: (typeof categories)[S][number]; text: string };
-}[Scope];
+export type Memory = { id: string; text: string; kind: MemoryKind; project?: string; scope: Scope; weight: number; revisedAt: number };
+export type Draft = { scope: Scope; kind: MemoryKind; text: string };
 type StoredMemory = Omit<Memory, "id" | "scope"> & { id: RecordId<"memory", string> };
-type Search = { text: string; embedding: Embedding; limit: number; scope?: Scope; category?: Category };
+type Search = { text: string; embedding: Embedding; limit: number; scope?: Scope; kind?: MemoryKind };
 type Bindings = Record<string, unknown>;
 export type ImportData = {
-  memories: { text: string; category: Category; project?: string; embedding: Embedding }[];
+  memories: { text: string; kind: MemoryKind; project?: string; revisedAt?: number; embedding: Embedding }[];
   skills: { name: string; description: string; text: string; project?: string }[];
   pins: { text: string; project?: string }[];
   unmatchedProjects: { name: string; id: string }[];
 };
 
-const projection = "id, text, category, project";
+const projection = "id, text, kind, project, weight, revisedAt";
 const maxIndexSize = 0xffff_ffff;
 const currentProject = "($project != NONE AND project = $project)";
 const globalScope = "project = NONE";
@@ -41,8 +35,8 @@ async function activeField(db: Surreal) {
 }
 const record = (id: string) => new RecordId("memory", id);
 
-function memory({ id, text, category, project }: StoredMemory): Memory {
-  return { id: id.id, text, category, project, scope: project === undefined ? "global" : "project" };
+function memory({ id, text, kind, project, weight, revisedAt }: StoredMemory): Memory {
+  return { id: id.id, text, kind, project, weight, revisedAt, scope: project === undefined ? "global" : "project" };
 }
 
 function positiveInt(value: number, name: string): void {
@@ -103,7 +97,9 @@ export class MemoryStore {
         DEFINE FIELD slot ON mem_config TYPE int DEFAULT 0;
         DEFINE TABLE memory SCHEMAFULL;
         DEFINE FIELD text ON memory TYPE string;
-        DEFINE FIELD category ON memory TYPE string;
+        DEFINE FIELD kind ON memory TYPE ${memoryKinds.map((kind) => `'${kind}'`).join(" | ")};
+        DEFINE FIELD weight ON memory TYPE int DEFAULT 0 ASSERT $value >= 0;
+        DEFINE FIELD revisedAt ON memory TYPE int DEFAULT time::millis();
         DEFINE FIELD project ON memory TYPE option<string>;
         DEFINE FIELD embedding ON memory TYPE option<array<float>>;
         DEFINE FIELD embedding_alt ON memory TYPE option<array<float>>;
@@ -111,7 +107,7 @@ export class MemoryStore {
         DEFINE TABLE smart_pin SCHEMALESS;
         DEFINE TABLE smart_skill SCHEMALESS;
         DEFINE TABLE smart_transcript SCHEMALESS;
-        DEFINE INDEX memory_scope ON memory FIELDS project, category;
+        DEFINE INDEX memory_scope ON memory FIELDS project, kind;
         DEFINE ANALYZER memory_terms TOKENIZERS blank,class,camel,punct FILTERS lowercase;
         DEFINE INDEX transcript_text ON smart_transcript FIELDS text FULLTEXT ANALYZER memory_terms BM25;
         DEFINE INDEX memory_text ON memory FIELDS text FULLTEXT ANALYZER memory_terms BM25;
@@ -177,17 +173,14 @@ export class MemoryStore {
   async add(draft: Draft, embedding: Embedding, signal?: AbortSignal): Promise<Memory> {
     const project = draft.scope === "project" ? this.#project : undefined;
     if (draft.scope === "project" && project === undefined) throw new Error("No current project for this memory");
-    if (!(categories[draft.scope] as readonly Category[]).includes(draft.category)) {
-      throw new Error(`Invalid category for ${draft.scope} memory: ${draft.category}`);
-    }
     return this.#use(async (db) => {
       await assertEmbedding(db, embedding);
       const field = await activeField(db);
       signal?.throwIfAborted();
       const [row] = await db.query<[StoredMemory]>(`CREATE ONLY $id SET
-        text = $text, category = $category, project = $project, ${field} = $embedding
+        text = $text, kind = $kind, project = $project, ${field} = $embedding
         RETURN ${projection}`, {
-        id: record(randomUUID()), text: draft.text, category: draft.category, project, embedding: embedding.values,
+        id: record(randomUUID()), text: draft.text, kind: draft.kind, project, embedding: embedding.values,
       });
       return memory(row);
     });
@@ -211,7 +204,7 @@ export class MemoryStore {
       await assertEmbedding(db, embedding);
       const field = await activeField(db);
       signal?.throwIfAborted();
-      const [rows] = await db.query<[StoredMemory[]]>(`UPDATE $id SET text = $text, ${field} = $embedding
+      const [rows] = await db.query<[StoredMemory[]]>(`UPDATE $id SET revisedAt = IF text != $text { time::millis() } ELSE { revisedAt }, text = $text, ${field} = $embedding
         WHERE ${visible} RETURN ${projection}`, this.#bind({ id: record(id), text, embedding: embedding.values }));
       return rows[0] && memory(rows[0]);
     });
@@ -225,10 +218,10 @@ export class MemoryStore {
     });
   }
 
-  async search({ text, embedding, limit, scope, category }: Search): Promise<Memory[]> {
+  async search({ text, embedding, limit, scope, kind }: Search): Promise<Memory[]> {
     positiveInt(limit, "Search limit");
     const filter = scope === "project" ? currentProject : scope === "global" ? globalScope : visible;
-    const predicate = `${filter}${category === undefined ? "" : " AND category = $category"}`;
+    const predicate = `${filter}${kind === undefined ? "" : " AND kind = $kind"}`;
     return this.#use(async (db) => {
       await assertEmbedding(db, embedding);
       const field = await activeField(db);
@@ -240,7 +233,7 @@ export class MemoryStore {
         LET $hits = search::rrf([$vectors, $terms], $limit, 60);
         RETURN $hits;
         SELECT ${projection} FROM $hits.id;
-      `, this.#bind({ text, category, limit, embedding: embedding.values }));
+      `, this.#bind({ text, kind, limit, embedding: embedding.values }));
       const byId = new Map(rows.map((row) => [row.id.id, row]));
       return hits.map(({ id }) => {
         const row = byId.get(id.id);
@@ -259,7 +252,7 @@ export class MemoryStore {
         LET $anchor = (SELECT VALUE ${field} FROM ONLY $id WHERE ${currentProject});
         IF $anchor = NONE { RETURN []; } ELSE {
           RETURN SELECT ${projection}, vector::distance::knn() AS distance FROM memory
-            WHERE ${globalScope} AND category = 'user_preference'
+            WHERE ${globalScope} AND kind = 'preference'
               AND ${field} <|${limit},${Math.max(limit, 100)}|> $anchor ORDER BY distance ASC;
         };
       `, this.#bind({ id: record(id) }));
@@ -363,9 +356,11 @@ export class MemoryStore {
     }
     return this.#use(async (db) => {
       await assertEmbedding(db, embedding);
+      let weight = 0;
       for (const note of expected) {
         const current = await this.#read(db, note.id);
         if (!current || current.text !== note.text || current.project !== note.project) return false;
+        weight = Math.max(weight, current.weight);
       }
       const field = await activeField(db);
       const keep = record(survivor.id);
@@ -380,7 +375,7 @@ export class MemoryStore {
       }
       signal?.throwIfAborted();
       await db.query(`BEGIN TRANSACTION;
-        UPDATE $keep SET text = $text, ${field} = $embedding;
+        UPDATE $keep SET text = $text, weight = $weight, ${field} = $embedding;
         DELETE $discard;
         FOR $edge IN $edges {
           LET $from = $edge.from;
@@ -389,7 +384,7 @@ export class MemoryStore {
             RELATE $from->memory_link->$to;
           };
         };
-        COMMIT TRANSACTION;`, { keep, discard, text, embedding: embedding.values, edges: [...redirected.values()] });
+        COMMIT TRANSACTION;`, { keep, discard, text, weight, embedding: embedding.values, edges: [...redirected.values()] });
       return true;
     });
   }

@@ -2,9 +2,9 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { Category } from "./memory-store.ts";
+import type { MemoryKind } from "./memory-store.ts";
 
-export type HermesMemory = { text: string; category: Category; project?: string };
+export type HermesMemory = { text: string; kind: MemoryKind; project?: string; revisedAt?: number };
 export type HermesSkill = { name: string; description: string; text: string; project?: string };
 export type HermesPin = { text: string; project?: string };
 export type HermesSource = { memories: HermesMemory[]; skills: HermesSkill[]; pins: HermesPin[]; folders: Map<string, string | undefined> };
@@ -18,16 +18,14 @@ const list = async (path: string) => (await readdir(path, { withFileTypes: true 
   .sort((a, b) => a.name.localeCompare(b.name));
 const isDirectory = async (path: string) => (await stat(path).catch(missing))?.isDirectory() ?? false;
 
-async function memoryFile(path: string, category: Category, project?: string): Promise<HermesMemory[]> {
+async function memoryFile(path: string, options: { kind: MemoryKind; project?: string; useProjectTag?: true }): Promise<HermesMemory[]> {
   return (await readOptional(path) ?? "").split(/\r?\n§\r?\n/).flatMap((entry) => {
-    const metadata = entry.match(/\s*<!--\s*created=[^,]+,\s*last=[^,>]+(?:,\s*project64=([A-Za-z0-9_-]+))?\s*-->\s*$/);
+    const metadata = entry.match(/\s*<!--\s*created=([^,]+),\s*last=[^,>]+(?:,\s*project64=([A-Za-z0-9_-]+))?\s*-->\s*$/);
     const text = (metadata ? entry.slice(0, metadata.index) : entry).trim();
     if (!text) return [];
-    if (category === "global_workflow_failure" && metadata?.[1]) {
-      const failureProject = Buffer.from(metadata[1], "base64url").toString("utf8").trim();
-      if (failureProject) return [{ text, category: "local_failure" as const, project: failureProject }];
-    }
-    return [{ text, category, project }];
+    const projectTag = options.useProjectTag && metadata?.[2] ? Buffer.from(metadata[2], "base64url").toString("utf8").trim() : undefined;
+    const created = metadata ? Date.parse(metadata[1].trim()) : NaN;
+    return [{ text, kind: options.kind, project: projectTag || options.project, revisedAt: Number.isFinite(created) ? created : undefined }];
   });
 }
 
@@ -102,9 +100,9 @@ export async function readHermesSource(agentDir: string, cwd: string): Promise<H
     ? join(agentDir, "pi-hermes-memory") : configured;
   const projectRoot = configuredPath(config.projectsMemoryDir, "projects-memory");
   const memories = [
-    ...await memoryFile(join(globalDir, "MEMORY.md"), "user_preference"),
-    ...await memoryFile(join(globalDir, "USER.md"), "user_preference"),
-    ...await memoryFile(join(globalDir, "failures.md"), "global_workflow_failure"),
+    ...await memoryFile(join(globalDir, "MEMORY.md"), { kind: "note" }),
+    ...await memoryFile(join(globalDir, "USER.md"), { kind: "preference" }),
+    ...await memoryFile(join(globalDir, "failures.md"), { kind: "note", useProjectTag: true }),
   ];
   const skills = await skillsFolder(join(globalDir, "skills"));
   const pins = await pinFile(join(globalDir, "STANDING.md"));
@@ -112,7 +110,7 @@ export async function readHermesSource(agentDir: string, cwd: string): Promise<H
   for (const item of await list(projectRoot)) {
     if (!item.isDirectory()) continue;
     const path = join(projectRoot, item.name);
-    const notes = await memoryFile(join(path, "MEMORY.md"), "repository_information", item.name);
+    const notes = await memoryFile(join(path, "MEMORY.md"), { kind: "note", project: item.name });
     const procedures = await skillsFolder(join(path, "skills"), item.name);
     if (!notes.length && !procedures.length) continue;
     projects.add(item.name);
