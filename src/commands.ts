@@ -8,5 +8,6 @@ export const commands = {
   link: `${prefix}link`,
   consolidate: `${prefix}consolidate`,
   reclassify: `${prefix}reclassify`,
+  cleanupConflicts: `${prefix}cleanup-conflicts`,
   pin: `${prefix}pin`,
 } as const;

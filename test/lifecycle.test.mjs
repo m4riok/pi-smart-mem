@@ -88,7 +88,7 @@ const injections = (sessionManager) => sessionManager.getEntries().filter((e) =>
 test("unconfigured startup warns without opening the picker; setup command asks before creating storage", async (t) => {
   const { session, dialogs, directory, alerts, errors, faux } = await fixture(t, { setup: true });
   assert.deepEqual(session.extensionRunner.getRegisteredCommands().map(({ name }) => name).sort(), [
-    "psm-consolidate", "psm-inject", "psm-link", "psm-migrate-hermes", "psm-pin", "psm-reclassify", "psm-settings", "psm-setup",
+    "psm-cleanup-conflicts", "psm-consolidate", "psm-inject", "psm-link", "psm-migrate-hermes", "psm-pin", "psm-reclassify", "psm-settings", "psm-setup",
   ]);
   assert.deepEqual(dialogs, []);
   assert.ok(alerts.some(([message, level]) => level === "warning" && message.includes("/psm-setup")));
@@ -515,6 +515,23 @@ test("review boosts once per incident, including independently verified evidence
   await session.prompt("Check the other test wrapper.");
   await session.prompt("Show the status.");
   assert.deepEqual(await store.read(note.id), { ...note, weight: 2 });
+  assert.deepEqual(errors, []);
+});
+
+test("cleanup guidance-only dispatches a scoped decision without running memory cleanup", async (t) => {
+  const { session, faux, store, note, directory, errors, alerts } = await fixture(t);
+  await writeFile(join(directory, "..", "SYSTEM.md"), "Current global directive: remove this conflicting fixture.");
+  faux.setResponses([({ messages }) => {
+    const { guidance, notes } = JSON.parse(text(messages));
+    assert.match(JSON.stringify(guidance), /Current global directive/);
+    assert.deepEqual(notes.map(({ id }) => id), [note.id]);
+    assert.deepEqual(getCurrentTools(messages).map(({ name }) => name), ["psm_cleanup_guidance_batch"]);
+    return fauxAssistantMessage(fauxToolCall("psm_cleanup_guidance_batch", { updates: [{ id: note.id, text: null }] }));
+  }]);
+  await session.prompt("/psm-cleanup-conflicts guidance-only");
+  assert.equal(faux.state.callCount, 1);
+  assert.equal(await store.read(note.id), undefined);
+  assert.ok(alerts.some(([message]) => message === "Cleaned up 1 conflicting memories"));
   assert.deepEqual(errors, []);
 });
 

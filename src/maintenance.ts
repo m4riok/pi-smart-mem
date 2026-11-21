@@ -7,6 +7,7 @@ import { runModel, type ModelContext } from "./review.ts";
 import { prompt, type Settings } from "./settings.ts";
 
 type MaintenanceFailure = { scope: Scope; noteId: string; attempt: 1 | 2; reason: string };
+export const maintenanceShortlistSize = 8;
 export type MaintenanceResult = { changes: number; skipped: number };
 type Options = {
   kind: "link" | "consolidate"; scopes: Scope[]; automatic?: boolean; store: MemoryStore; ctx: ModelContext;
@@ -21,7 +22,7 @@ async function judgeNote(options: Options, id: string, attempt: 1 | 2, retryDeci
   const { store, kind, settings, ctx, messages, embed, signal } = options;
   const source = await store.read(id);
   if (!source) return;
-  const candidates = await store.candidates(source, 8, kind === "consolidate");
+  const candidates = await store.candidates(source, maintenanceShortlistSize, kind === "consolidate");
   if (kind === "link" && candidates.length === 0) { await store.markReviewed(source, signal); return; }
   const allowed = new Map(candidates.map((candidate) => [candidate.id, candidate]));
   const payload = { source, candidates };

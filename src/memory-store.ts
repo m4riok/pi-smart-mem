@@ -228,6 +228,30 @@ export class MemoryStore {
     });
   }
 
+  async cleanGuidance(changes: readonly { note: Memory; replacement: { text: string; embedding: Embedding } | null }[], signal?: AbortSignal): Promise<number> {
+    if (!changes.length) return 0;
+    return this.#use(async (db) => {
+      const updates = [];
+      const field = await activeField(db);
+      for (const { note, replacement } of changes) {
+        const current = await this.#read(db, note.id);
+        if (!current || current.text !== note.text || current.revisedAt !== note.revisedAt || replacement?.text === current.text) continue;
+        if (replacement) await assertEmbedding(db, replacement.embedding);
+        updates.push({ id: record(note.id), text: replacement?.text, embedding: replacement?.embedding.values });
+      }
+      if (!updates.length) return 0;
+      signal?.throwIfAborted();
+      await db.query(`BEGIN TRANSACTION;
+        FOR $change IN $updates {
+          LET $id = $change.id;
+          IF $change.text = NONE { DELETE $id; }
+          ELSE { UPDATE $id SET text = $change.text, ${field} = $change.embedding; };
+        };
+        COMMIT TRANSACTION;`, { updates });
+      return updates.length;
+    });
+  }
+
   async reinforce(id: string, incident: string, signal?: AbortSignal): Promise<boolean> {
     return this.#use(async (db) => {
       if (!await this.#read(db, id)) return false;
@@ -392,7 +416,7 @@ export class MemoryStore {
       let weight = 0;
       for (const note of expected) {
         const current = await this.#read(db, note.id);
-        if (!current || current.text !== note.text || current.project !== note.project) return false;
+        if (!current || current.text !== note.text || current.project !== note.project || current.revisedAt !== note.revisedAt) return false;
         weight = Math.max(weight, current.weight);
       }
       const field = await activeField(db);

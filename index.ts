@@ -11,6 +11,7 @@ import { migrateHermes } from "./src/hermes-migration.ts";
 import { readHermesSource } from "./src/hermes-source.ts";
 import { maintain, type MaintenanceResult } from "./src/maintenance.ts";
 import { reclassifyMemories, type BatchOptions } from "./src/maintenance-batch.ts";
+import { cleanupConflicts, cleanupMode, conflictGuidance } from "./src/conflict-cleanup.ts";
 import { Diagnostics } from "./src/diagnostics.ts";
 import { commands } from "./src/commands.ts";
 import { MemoryPanel, memoryPanelShortcut, type Activity, type Level } from "./src/memory-panel.ts";
@@ -643,6 +644,16 @@ export default function smartMemory(pi: ExtensionAPI): void {
   registerMaintenanceCommand(commands.reclassify, "Review and update stored memory kinds", (args, ctx) =>
     batchJob(ctx, "reclassify", "Reclassifying memories", scopedMaintenance(project, args),
       (changes) => `Reclassified ${changes} saved memories`, reclassifyMemories));
+
+  registerMaintenanceCommand(commands.cleanupConflicts, "Clean up stored memory conflicts with guidance or other memories", (args, ctx) => {
+    const mode = cleanupMode(args);
+    const scopes: Scope[] = project ? ["project", "global"] : ["global"];
+    const promptOptions = ctx.getSystemPromptOptions();
+    return batchJob(ctx, "cleanup-conflicts", "Cleaning up memory conflicts", scopes,
+      (changes) => `Cleaned up ${changes} conflicting memories`,
+      (options) => cleanupConflicts(options, mode, (text, signal) => embed(text, false, signal),
+        () => conflictGuidance(promptOptions, getAgentDir())), true);
+  });
 
   registerCommand(commands.pin, {
     description: "Save standing instructions for this project or globally",

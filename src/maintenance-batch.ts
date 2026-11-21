@@ -34,8 +34,22 @@ export function resolveBatch<T extends { id: string }>(notes: readonly Memory[],
   });
 }
 
+export async function retryDecision(options: BatchOptions, scope: Scope, ids: string[], status: string, decide: () => Promise<number>): Promise<MaintenanceResult> {
+  const { progress, signal, onFailure } = options;
+  for (const attempt of [1, 2] as const) {
+    signal?.throwIfAborted();
+    progress(attempt === 1 ? status : `${status} · retrying`);
+    try { return { changes: await decide(), skipped: 0 }; }
+    catch (error) {
+      signal?.throwIfAborted();
+      onFailure(scope, ids, attempt, String(error));
+    }
+  }
+  return { changes: 0, skipped: ids.length };
+}
+
 export async function runBatches(options: BatchOptions, title: string, decide: (scope: Scope, notes: Memory[]) => Promise<number>): Promise<MaintenanceResult> {
-  const { scopes, store, progress, signal, onFailure } = options;
+  const { scopes, store, signal } = options;
   const result = { changes: 0, skipped: 0 };
   for (const scope of scopes) {
     signal?.throwIfAborted();
@@ -43,16 +57,9 @@ export async function runBatches(options: BatchOptions, title: string, decide: (
     for (let i = 0; i < notes.length; i += batchSize) {
       const batch = notes.slice(i, i + batchSize);
       const status = `${title} ${scope} memories: ${i + 1}–${i + batch.length}/${notes.length}`;
-      for (const attempt of [1, 2] as const) {
-        signal?.throwIfAborted();
-        progress(attempt === 1 ? status : `${status} · retrying`);
-        try { result.changes += await decide(scope, batch); break; }
-        catch (error) {
-          signal?.throwIfAborted();
-          onFailure(scope, batch.map(({ id }) => id), attempt, String(error));
-          if (attempt === 2) result.skipped += batch.length;
-        }
-      }
+      const outcome = await retryDecision(options, scope, batch.map(({ id }) => id), status, () => decide(scope, batch));
+      result.changes += outcome.changes;
+      result.skipped += outcome.skipped;
     }
   }
   return result;
