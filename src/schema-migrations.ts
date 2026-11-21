@@ -3,6 +3,7 @@ import { NotFoundError, type Surreal } from "surrealdb";
 // Version zero is the initialized schema before version tracking was added.
 const migrations = [
   "DEFINE FIELD IF NOT EXISTS consolidated ON memory TYPE option<bool>;",
+  "DEFINE FIELD IF NOT EXISTS linkChecked ON memory TYPE option<bool>;"
 ] as const;
 
 const schemaTable = "smart_schema";

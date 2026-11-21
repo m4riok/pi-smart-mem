@@ -16,6 +16,7 @@ const vector = (...values) => ({ model: space.model, values });
 const query = vector(1, 0, 0);
 const projectNote = (text) => ({ scope: "project", kind: "note", text });
 const preference = (text) => ({ scope: "global", kind: "preference", text });
+const saveEdge = (store, from, to) => store.saveLinks([from, to], [{ from: from.id, to: to.id }], []);
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), "smart-mem-store-"));
@@ -29,17 +30,27 @@ async function fixture(t) {
 test("concurrent opens upgrade an unversioned store once without clearing check markers", async (t) => {
   const { path, store, global } = await fixture(t);
   const queryDb = (sql) => withDatabase(path, false, (db) => db.query(sql).collect());
-  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [1]);
+  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [2]);
+  await queryDb(`REMOVE TABLE smart_schema; REMOVE FIELD linkChecked ON memory;
+    DEFINE FIELD reviewed ON memory TYPE bool DEFAULT false;`);
   const note = await global.add(preference("A checked legacy note"), query);
+  const neighbor = await global.add(preference("A legacy neighbor"), query);
   await global.markConsolidated(note, true);
-  await queryDb("REMOVE TABLE smart_schema;");
+  await global.markConsolidated(neighbor, true);
+  await withDatabase(path, false, (db) => db.query("UPDATE memory SET reviewed = true; RELATE $from->memory_link->$to;", {
+    from: new RecordId("memory", note.id), to: new RecordId("memory", neighbor.id),
+  }));
   const transitions = [];
   const open = (store) => store.embeddingSpace({ observe: (...event) => transitions.push(event) });
   assert.deepEqual(await Promise.all([open(store), open(global)]), [space, space]);
-  assert.deepEqual(transitions, [["start", 0, 1], ["applied", 0, 1]]);
+  assert.deepEqual(transitions, [["start", 0, 1], ["applied", 0, 1], ["start", 1, 2], ["applied", 1, 2]]);
   assert.deepEqual(await global.read(note.id), note);
   assert.deepEqual(await global.list("global", "unconsolidated"), []);
-  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [1]);
+  assert.deepEqual(new Set((await global.linkingSnapshot("global")).sources), new Set([note, neighbor]));
+  assert.deepEqual(await global.related(note.id), [neighbor]);
+  assert.deepEqual(await global.related(neighbor.id), [note]);
+  assert.equal(await saveEdge(global, neighbor, note), 0);
+  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [2]);
 });
 
 test("a failed schema upgrade rolls back its field and version together", async (t) => {
@@ -56,7 +67,7 @@ test("a failed schema upgrade rolls back its field and version together", async 
   assert.equal(version, undefined);
   await queryDb("REMOVE FIELD version ON smart_schema;");
   assert.deepEqual(await store.embeddingSpace({ observe: (...event) => events.push(event) }), space);
-  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [1]);
+  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [2]);
 });
 
 test("explicit initialization and durable scoped CRUD", async (t) => {
@@ -135,19 +146,41 @@ test("links are one-hop, scoped and retained on edit; related preferences do not
   assert.deepEqual(await store.relatedGlobalPreferences(first.id, 3), [shared]);
   assert.deepEqual(await other.relatedGlobalPreferences(first.id, 3), []);
   assert.deepEqual(await store.related(first.id), []);
-  assert.equal(await store.link(first.id, neighbor.id), true);
-  assert.equal(await store.link(first.id, neighbor.id), false);
-  assert.equal(await store.link(neighbor.id, shared.id), true);
-  assert.equal(await store.link(neighbor.id, wrongRepo.id), false);
-  assert.equal(await store.link(shared.id, neighbor.id), false);
+  assert.equal(await saveEdge(store, first, neighbor), 1);
+  assert.equal(await saveEdge(store, neighbor, first), 0);
+  assert.equal(await saveEdge(store, neighbor, shared), 1);
+  await assert.rejects(saveEdge(store, neighbor, wrongRepo), /changed during linking/);
+  await assert.rejects(saveEdge(store, shared, neighbor), /Ineligible link endpoints/);
   assert.deepEqual(await store.related(first.id), [neighbor]);
-  assert.deepEqual(await store.related(neighbor.id), [shared]);
+  assert.deepEqual(new Set(await store.related(neighbor.id)), new Set([first, shared]));
+  assert.deepEqual(await store.related(shared.id), []);
   assert.deepEqual(await other.related(neighbor.id), []);
   const edited = await store.replace(neighbor.id, "JWT generation and TTL", vector(0.8, 0.6, 0));
   assert.deepEqual(await store.related(first.id), [edited]);
-  assert.deepEqual(await store.related(neighbor.id), [shared]);
+  assert.deepEqual(new Set(await store.related(neighbor.id)), new Set([first, shared]));
   assert.equal(await store.remove(neighbor.id), true);
   assert.deepEqual(await store.related(first.id), []);
+});
+
+test("link judgments cannot commit stale text, and text-only invalidation is independent of consolidation", async (t) => {
+  const { store, global } = await fixture(t);
+  const source = await store.add(projectNote("Use test fixtures"), query);
+  const target = await global.add(preference("Do not run against live data"), query);
+  const pair = { from: source.id, to: target.id };
+  const edited = await store.replace(source.id, "Use isolated test fixtures", query);
+  await assert.rejects(store.saveLinks([source, target], [pair], [source.id]), /changed during linking/);
+  assert.deepEqual(await store.related(source.id), []);
+  assert.deepEqual((await store.linkingSnapshot("project")).sources, [edited]);
+  assert.equal(await store.saveLinks([edited, target], [pair], [source.id]), 1);
+  assert.deepEqual(await store.list("project", "unconsolidated"), [edited]);
+  await store.reclassify([{ note: edited, kind: "guideline" }]);
+  await store.reinforce(edited.id, "fixture-incident");
+  await store.markConsolidated(edited, true);
+  assert.deepEqual((await store.linkingSnapshot("project")).sources, []);
+  const current = await store.read(source.id);
+  await store.cleanGuidance([{ note: current, replacement: { text: "Use isolated fixtures", embedding: query } }]);
+  assert.deepEqual((await store.linkingSnapshot("project")).sources.map(({ id }) => id), [source.id]);
+  assert.deepEqual(await store.related(source.id), [target]);
 });
 
 test("merge redirects incoming and outgoing links and keeps scope and kind", async (t) => {
@@ -159,15 +192,18 @@ test("merge redirects incoming and outgoing links and keeps scope and kind", asy
   await withDatabase(path, false, (db) => db.query("UPDATE $keep SET weight = 2; UPDATE $drop SET weight = 5;", {
     keep: new RecordId("memory", keep.id), drop: new RecordId("memory", drop.id),
   }));
-  await store.link(from.id, drop.id);
-  await store.link(keep.id, drop.id);
-  await store.link(drop.id, target.id);
-  await store.link(keep.id, target.id);
+  await saveEdge(store, from, drop);
+  await saveEdge(store, keep, drop);
+  await saveEdge(store, drop, target);
+  await saveEdge(store, keep, target);
+  await store.saveLinks([keep], [], [keep.id]);
+  assert.ok(!(await store.linkingSnapshot("project")).sources.some(({ id }) => id === keep.id));
   const text = "Run check against an isolated database fixture";
   assert.equal(await store.merge(keep, [drop], text, query), true);
   assert.equal(await store.read(drop.id), undefined);
   assert.deepEqual(await store.related(from.id), [{ ...keep, text, weight: 5 }]);
-  assert.deepEqual(await store.related(keep.id), [target]);
+  assert.deepEqual(new Set(await store.related(keep.id)), new Set([from, target]));
+  assert.ok((await store.linkingSnapshot("project")).sources.some(({ id }) => id === keep.id));
   await assert.rejects(store.merge(keep, [target], text, query), /same scope/);
 });
 

@@ -13,6 +13,7 @@ export type EmbeddingSpace = { model: string; dimensions: number };
 export type Embedding = { model: string; values: readonly number[] };
 export type Memory = { id: string; text: string; kind: MemoryKind; project?: string; scope: Scope; weight: number; revisedAt: number };
 export type Draft = { scope: Scope; kind: MemoryKind; text: string };
+export type LinkPair = { from: string; to: string };
 type StoredMemory = Omit<Memory, "id" | "scope"> & { id: RecordId<"memory", string> };
 type Search = { text: string; embedding: Embedding; limit: number; scope?: Scope; kind?: MemoryKind };
 type Bindings = Record<string, unknown>;
@@ -35,6 +36,7 @@ async function activeField(db: Surreal) {
   return fields[slot];
 }
 const record = (id: string) => new RecordId("memory", id);
+const linkKey = (from: string, to: string) => JSON.stringify([from, to]);
 
 function memory({ id, text, kind, project, weight, revisedAt }: StoredMemory): Memory {
   return { id: id.id, text, kind, project, weight, revisedAt, scope: project === undefined ? "global" : "project" };
@@ -106,7 +108,6 @@ export class MemoryStore {
         DEFINE FIELD project ON memory TYPE option<string>;
         DEFINE FIELD embedding ON memory TYPE option<array<float>>;
         DEFINE FIELD embedding_alt ON memory TYPE option<array<float>>;
-        DEFINE FIELD reviewed ON memory TYPE bool DEFAULT false;
         DEFINE TABLE memory_incident SCHEMALESS;
         DEFINE TABLE smart_pin SCHEMALESS;
         DEFINE TABLE smart_skill SCHEMALESS;
@@ -216,6 +217,7 @@ export class MemoryStore {
       const field = await activeField(db);
       signal?.throwIfAborted();
       const [rows] = await db.query<[StoredMemory[]]>(`UPDATE $id SET consolidated = IF text != $text { NONE } ELSE { consolidated },
+        linkChecked = IF text != $text { NONE } ELSE { linkChecked },
         revisedAt = IF text != $text { time::millis() } ELSE { revisedAt }, text = $text, ${field} = $embedding
         WHERE ${visible} RETURN ${projection}`, this.#bind({ id: record(id), text, embedding: embedding.values }));
       return rows[0] && memory(rows[0]);
@@ -256,7 +258,7 @@ export class MemoryStore {
         FOR $change IN $updates {
           LET $id = $change.id;
           IF $change.text = NONE { DELETE $id; }
-          ELSE { UPDATE $id SET text = $change.text, consolidated = NONE, ${field} = $change.embedding; };
+          ELSE { UPDATE $id SET text = $change.text, consolidated = NONE, linkChecked = NONE, ${field} = $change.embedding; };
         };
         COMMIT TRANSACTION;`, { updates });
       return updates.length;
@@ -328,30 +330,68 @@ export class MemoryStore {
     });
   }
 
-  // Only link-building callers use this method; recall and CRUD never create edges.
-  async link(from: string, to: string, signal?: AbortSignal): Promise<boolean> {
-    if (from === to) return false;
+  async linkingSnapshot(scope: Scope, { full = false, signal }: { full?: boolean; signal?: AbortSignal } = {}): Promise<{ notes: Memory[]; sources: Memory[] }> {
+    const [rows] = await this.#use((db) => db.query<[(StoredMemory & { linkChecked?: boolean })[]]>(
+      `SELECT ${projection}, linkChecked FROM memory WHERE ${scope === "project" ? visible : globalScope} ORDER BY id`, this.#bind({}),
+    ).collect(), signal);
+    return {
+      notes: rows.map(memory),
+      sources: rows.filter((row) => (full || !row.linkChecked) && (row.project === undefined ? scope === "global" : scope === "project")).map(memory),
+    };
+  }
+
+  // Commit edges and completed source checks together. Another Pi session can
+  // edit or remove a note while the model is judging its snapshot.
+  async saveLinks(notes: readonly Memory[], pairs: readonly LinkPair[], checked: readonly string[], signal?: AbortSignal): Promise<number> {
     return this.#use(async (db) => {
-      const source = await this.#read(db, from);
-      const target = await this.#read(db, to);
-      if (!source || !target || (source.scope === "global" && target.scope === "project")) return false;
-      const bindings = { from: record(from), to: record(to) };
-      const [existing] = await db.query<[RecordId[]]>("SELECT VALUE id FROM memory_link WHERE in = $from AND out = $to LIMIT 1", bindings);
-      if (existing.length > 0) return false;
+      const ids = notes.map(({ id }) => record(id));
+      const [rows] = await db.query<[StoredMemory[]]>(`SELECT ${projection} FROM $ids WHERE ${visible}`, this.#bind({ ids }));
+      const current = new Map(rows.map((row) => [row.id.id, row]));
+      for (const note of notes) {
+        const row = current.get(note.id);
+        if (!row || row.text !== note.text || row.project !== note.project || row.revisedAt !== note.revisedAt) {
+          throw new Error(`Memory ${note.id} changed during linking; rerun to check its current text`);
+        }
+      }
+      if (checked.some((id) => !current.has(id))) throw new Error("Cannot mark a memory outside the link batch checked");
+      const edges = [];
+      if (pairs.length) {
+        const [stored] = await db.query<[{ in: StoredMemory["id"]; out: StoredMemory["id"] }[]]>(
+          "SELECT in, out FROM memory_link WHERE in INSIDE $ids AND out INSIDE $ids", { ids },
+        );
+        const seen = new Set(stored.map((edge) => linkKey(edge.in.id, edge.out.id)));
+        for (const { from, to } of pairs) {
+          const source = current.get(from);
+          const target = current.get(to);
+          if (!source || !target || from === to || (target.project !== undefined && target.project !== source.project)) {
+            throw new Error("Ineligible link endpoints");
+          }
+          const key = linkKey(from, to);
+          if (seen.has(key) || (source.project === target.project && seen.has(linkKey(to, from)))) continue;
+          edges.push({ from: source.id, to: target.id });
+          seen.add(key);
+        }
+      }
+      if (!edges.length && !checked.length) return 0;
       signal?.throwIfAborted();
-      await db.query("RELATE $from->memory_link->$to", bindings);
-      return true;
-    });
+      await db.query(`BEGIN TRANSACTION;
+        FOR $edge IN $edges { LET $from = $edge.from; LET $to = $edge.to; RELATE $from->memory_link->$to; };
+        UPDATE $checked SET linkChecked = true;
+        COMMIT TRANSACTION;`, { edges, checked: checked.map(record) });
+      return edges.length;
+    }, signal);
   }
 
   async related(id: string): Promise<Memory[]> {
     return this.#use(async (db) => {
       const source = await this.#read(db, id);
       if (!source) return [];
-      const condition = source.scope === "global" ? "out.project = NONE" : "(out.project = NONE OR out.project = $project)";
-      const [, rows] = await db.query<[undefined, StoredMemory[]]>(`
-        LET $targets = (SELECT VALUE out FROM memory_link WHERE in = $id AND ${condition});
-        SELECT ${projection} FROM $targets;
+      const incoming = source.scope === "global" ? "in.project = NONE" : "in.project = $project";
+      const outgoing = source.scope === "global" ? "out.project = NONE" : "(out.project = NONE OR out.project = $project)";
+      const [, , rows] = await db.query<[undefined, undefined, StoredMemory[]]>(`
+        LET $targets = (SELECT VALUE out FROM memory_link WHERE in = $id AND ${outgoing});
+        LET $origins = (SELECT VALUE in FROM memory_link WHERE out = $id AND ${incoming});
+        SELECT ${projection} FROM array::distinct(array::concat($targets, $origins));
       `, this.#bind({ id: record(id) }));
       return rows.map(memory);
     });
@@ -389,9 +429,9 @@ export class MemoryStore {
     });
   }
 
-  async list(scope: Scope, selection: boolean | "unconsolidated" = false): Promise<Memory[]> {
+  async list(scope: Scope, selection?: "unconsolidated"): Promise<Memory[]> {
     const filter = scope === "project" ? currentProject : globalScope;
-    const pending = selection === "unconsolidated" ? " AND consolidated != true" : selection ? " AND reviewed = false" : "";
+    const pending = selection === "unconsolidated" ? " AND consolidated != true" : "";
     const [rows] = await this.#use((db) => db.query<[StoredMemory[]]>(`SELECT ${projection} FROM memory WHERE ${filter}${pending} ORDER BY id`, this.#bind({})).collect());
     return rows.map(memory);
   }
@@ -402,13 +442,6 @@ export class MemoryStore {
       await db.query(`UPDATE $id SET consolidated = $checked WHERE ${visible} AND text = $text AND revisedAt = $revisedAt`,
         this.#bind({ id: record(note.id), text: note.text, revisedAt: note.revisedAt, checked }));
     }, signal);
-  }
-
-  async markReviewed(note: Memory, signal?: AbortSignal): Promise<void> {
-    await this.#use(async (db) => {
-      signal?.throwIfAborted();
-      await db.query(`UPDATE $id SET reviewed = true WHERE ${visible}`, this.#bind({ id: record(note.id) }));
-    });
   }
 
   async candidates(note: Memory, limit: number, sameScope: boolean): Promise<Memory[]> {
@@ -453,7 +486,7 @@ export class MemoryStore {
       signal?.throwIfAborted();
       await db.query(`BEGIN TRANSACTION;
         UPDATE $keep SET consolidated = IF $consolidated { true } ELSE IF text = $text { consolidated } ELSE { NONE },
-          text = $text, weight = $weight, ${field} = $embedding;
+          linkChecked = IF text = $text { linkChecked } ELSE { NONE }, text = $text, weight = $weight, ${field} = $embedding;
         DELETE $discard;
         FOR $edge IN $edges {
           LET $from = $edge.from;

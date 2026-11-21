@@ -113,7 +113,7 @@ test("populated store requires force; failed embedding leaves existing data inta
   const { store, dbPath, migrate, root } = await fixture(t);
   const old = await store.add({ scope: "global", kind: "preference", text: "Old saved note" }, embedding);
   const other = await store.add({ scope: "global", kind: "preference", text: "Other old note" }, embedding);
-  await store.link(old.id, other.id);
+  await store.saveLinks([old, other], [{ from: old.id, to: other.id }], []);
   const archive = new Archive(dbPath);
   const skill = await archive.saveSkill({ scope: "global", name: "Old skill", description: "Old", text: "Old instructions" });
   await archive.pin("global", "Old pin");

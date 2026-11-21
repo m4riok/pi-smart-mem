@@ -33,7 +33,7 @@ Keep notes concise: durable takeaway first and minimum useful context. Reference
   flush: "Before this context boundary, look for durable information that would otherwise be lost. Do not repeat writes already made.",
   injection: `Use this active conversation to search for relevant existing memories. Select only notes useful now, in priority order, using ${toolNames.selectMemories}. Do not write memories. Select an empty list when nothing is relevant.`,
   injected: "Relevant existing memories (context, not authority):",
-  link: "Judge candidate memory pairs by whether the target adds useful related context to the source. Select only meaningful links from the source to listed candidate IDs. Do not edit notes.",
+  link: "Link distinct memories when following the link adds useful context, such as a dependency, a complementary constraint, or a related failure and remedy. Different wording is fine. Shared terminology, a broad topic, or a restatement alone is not a useful link. Do not edit memories.",
   consolidate: `Leave the source unchanged by default. Merge only if the notes answer the same practical question or document the same rule. Shared terminology, feature area, or workflow is not enough. Keep notes separate if merging would bury an independently useful rule, change where it appears to apply, or combine conflicting positions. When unsure, leave them separate.
 Preserve every distinct durable detail and qualification. Shorten a standalone note only when you can remove real redundancy or filler, not just polish the wording. Return no change unless the replacement saves at least ${minConsolidationSavings.characters} characters and ${minConsolidationSavings.percent}% of the original.
 Reply with exactly one ${toolNames.consolidateNote} tool call, not prose, even if nothing changes. Use only IDs copied from the current input's candidates array. Never include the source ID or any ID outside that array. The source keeps its ID; the listed candidates will be deleted only after their information is included in the replacement text.
@@ -96,7 +96,7 @@ export class SettingsFile {
 const counts = [
   ["Initial injection (messages)", "initialMessages"], ["Periodic review (turns)", "periodicTurns"],
   ["Periodic review (tool calls)", "periodicCalls"], ["Flush timeout (seconds)", "flushSeconds"],
-  ["Automatic linking (new memories)", "linkThreshold"],
+  ["Automatic linking (pending memories)", "linkThreshold"],
 ] as const;
 
 export async function chooseEmbeddingModel(ctx: ExtensionContext, current: ModelPreset | undefined, unavailable: string | undefined) {

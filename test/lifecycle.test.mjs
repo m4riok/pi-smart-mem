@@ -21,7 +21,7 @@ import { prompts, SettingsFile } from "../src/settings.ts";
 
 const hermesNames = ["memory_add", "memory_replace", "memory_remove", "session_search", "memory_search"];
 
-async function fixture(t, { child = false, setup = false, empty = false, hermes = false, mode = "rpc", setWidget = () => {}, select, custom, confirm = false } = {}) {
+async function fixture(t, { child = false, setup = false, empty = false, hermes = false, mode = "rpc", setWidget = () => {}, select, custom, confirm = false, fauxModels } = {}) {
   const cwd = await mkdtemp(join(tmpdir(), "smart-mem-pi-"));
   const agentDir = join(cwd, "agent");
   const directory = join(agentDir, "pi-smart-mem");
@@ -58,7 +58,7 @@ async function fixture(t, { child = false, setup = false, empty = false, hermes 
     }
   }
   await new SettingsFile(directory).update({ initialMessages: 6, periodicTurns: 3, prompts: { recall: "Recall prompt fixture", correction: "Correction task fixture", explicit: "Explicit task fixture", periodic: "Periodic task fixture", injection: "Injection task fixture" } });
-  const faux = fauxProvider({ provider: "smart-mem-fixture", tokensPerSecond: 100000 });
+  const faux = fauxProvider({ provider: "smart-mem-fixture", tokensPerSecond: 100000, models: fauxModels });
   const modelRuntime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null, modelsStorePath: join(agentDir, "models-cache.json"), refreshOnCreate: false });
   modelRuntime.registerNativeProvider(faux.provider);
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 16 } });
@@ -126,6 +126,21 @@ async function pausedEmbeddingWorker(directory) {
 const text = (messages) => messages.filter((m) => m.role === "user").map((m) => contentText(m.content)).join("\n");
 const rows = (sessionManager) => sessionManager.getEntries().filter((e) => e.type === "custom" && e.customType === "smart-mem-review").map((e) => e.data);
 const injections = (sessionManager) => sessionManager.getEntries().filter((e) => e.type === "custom_message" && e.customType === "smart-mem-injection");
+const linkInput = (ctx) => JSON.parse(getCurrentSystemPrompt(ctx.messages).match(/^\{"notes":.+$/m)[0]);
+const linkReply = (links = []) => fauxAssistantMessage(fauxToolCall("psm_select_links", { links }));
+const linkPair = (from, to) => ({ from: from.id, to: to.id });
+const shortLinkContext = [{ id: "short-context", contextWindow: 8_000, maxTokens: 500 }];
+async function addLongLinkNotes(store) {
+  const { model, dimensions } = models[0];
+  const vector = { model, values: [1, ...Array(dimensions - 1).fill(0)] };
+  for (const name of ["A", "B", "C"]) {
+    await store.add({ scope: "global", kind: "note", text: `Fixture ${name}: ` + "many different words ".repeat(500) }, vector);
+  }
+}
+const linkMembers = (ctx) => {
+  const { notes, otherNotes = [] } = linkInput(ctx);
+  return [...notes, ...otherNotes];
+};
 
 async function waitFor(check, description) {
   const deadline = Date.now() + 4000;
@@ -165,23 +180,23 @@ test("startup displays and logs database upgrades, and blocks unsupported schema
   } });
   const path = join(directory, "db");
   const query = (sql) => withDatabase(path, false, (db) => db.query(sql).collect());
-  await query("REMOVE TABLE smart_schema; REMOVE FIELD consolidated ON memory;");
+  await query("UPDATE smart_schema:current SET version = 1; REMOVE FIELD linkChecked ON memory;");
   await session.reload();
-  assert.ok(frames.some((frame) => frame.includes("Schema 0 → 1")), JSON.stringify(frames));
-  assert.match(render(), /Smart Mem database upgraded to schema 1/);
+  assert.ok(frames.some((frame) => frame.includes("Schema 1 → 2")), JSON.stringify(frames));
+  assert.match(render(), /Smart Mem database upgraded to schema 2/);
   assert.deepEqual(await store.read(note.id), note);
   await session.reload();
   assert.doesNotMatch(render(), /database upgraded/);
   const log = async () => (await readFile(join(directory, "smart-mem.log"), "utf8")).trim().split("\n").map(JSON.parse);
   assert.deepEqual((await log()).filter(({ event }) => event.startsWith("schema.migration.")).map(({ event, from, to }) => ({ event, from, to })), [
-    { event: "schema.migration.start", from: 0, to: 1 },
-    { event: "schema.migration.applied", from: 0, to: 1 },
+    { event: "schema.migration.start", from: 1, to: 2 },
+    { event: "schema.migration.applied", from: 1, to: 2 },
   ]);
-  await query("UPDATE smart_schema:current SET version = 2;");
+  await query("UPDATE smart_schema:current SET version = 3;");
   await session.reload();
   assert.match(render(), /^🧠 ····  Not set up/);
-  assert.match(render(), /schema 2 is newer than supported schema 1/);
-  assert.ok((await log()).some(({ event, error }) => event === "schema.open_failed" && error.includes("schema 2")));
+  assert.match(render(), /schema 3 is newer than supported schema 2/);
+  assert.ok((await log()).some(({ event, error }) => event === "schema.open_failed" && error.includes("schema 3")));
   await session.prompt("/psm-consolidate global");
   assert.equal(faux.state.callCount, 0);
   assert.deepEqual(await store.read(note.id), note);
@@ -752,24 +767,26 @@ test("interactive Memory panel reports foreground tools and reviews without repl
 
 test("reloading Pi cancels background linking and replaces its old panel",  { timeout: 10_000 }, async (t) => {
   let rendered;
-  const { session, note, faux, store, errors } = await fixture(t, { mode: "tui", setWidget: (key, build) => {
+  const { session, faux, store, errors } = await fixture(t, { empty: true, fauxModels: shortLinkContext, mode: "tui", setWidget: (key, build) => {
     if (key !== "smart-mem") return;
     rendered = build?.({ requestRender() {} }, { fg: (_color, text) => text });
   } });
-  const { model, dimensions } = models[0];
-  const embedding = { model, values: Array.from({ length: dimensions }, (_, i) => i === 0 ? 1 : 0) };
-  await store.add({ scope: "global", kind: "preference", text: "Check return codes" }, embedding);
+  await addLongLinkNotes(store);
   const judging = Promise.withResolvers();
   const decision = Promise.withResolvers();
   t.after(() => decision.resolve());
-  faux.setResponses([async (ctx, options) => {
-    const { candidates } = JSON.parse(getCurrentSystemPrompt(ctx.messages).match(/^\{"source":.+$/m)[0]);
-    judging.resolve(options.signal);
+  let committed;
+  faux.setResponses([(ctx) => {
+    committed = linkPair(...linkMembers(ctx));
+    return linkReply([committed]);
+  }, async (ctx, options) => {
+    const pending = linkPair(...linkMembers(ctx));
+    judging.resolve({ signal: options.signal, pending });
     await decision.promise;
-    return fauxAssistantMessage(fauxToolCall("psm_select_links", { ids: [candidates[0].id] }));
+    return linkReply([pending]);
   }]);
   await session.prompt("/psm-link global");
-  const signal = await judging.promise;
+  const { signal, pending } = await judging.promise;
   assert.ok(rendered.render(100).some((line) => line.includes("Linking global memories")));
   const previous = rendered;
   await session.reload();
@@ -778,22 +795,24 @@ test("reloading Pi cancels background linking and replaces its old panel",  { ti
   assert.equal(rendered.render(100)[0], "🧠 ━━━━  Active");
   assert.ok(!rendered.render(100).some((line) => line.includes("Linking global memories")));
   decision.resolve();
-  assert.deepEqual(await store.related(note.id), []);
+  const related = async (id) => (await store.related(id)).map((note) => note.id);
+  assert.deepEqual(await related(committed.to), [committed.from]);
+  assert.ok(!(await related(pending.from)).includes(pending.to));
+  assert.equal((await store.linkingSnapshot("global")).sources.length, 3);
   assert.deepEqual(errors, []);
 });
 
-for (const kind of ["link", "consolidate"]) test(`${kind} retries an overloaded provider and skips a note after two tool failures`, async (t) => {
+test("consolidation retries an overloaded provider and skips a note after two tool failures", async (t) => {
   const { session, faux, store, alerts, errors, directory } = await fixture(t);
   const { model, dimensions } = models[0];
   const vector = { model, values: [1, ...Array(dimensions - 1).fill(0)] };
   for (const label of ["A", "B"]) await store.add({ scope: "global", kind: "preference", text: `Private fixture body ${label}` }, vector);
   const before = await store.list("global");
-  const name = kind === "link" ? "psm_select_links" : "psm_consolidate_note";
+  const name = "psm_consolidate_note";
   const calls = [];
   const response = (step, reply) => (ctx) => {
-    const system = getCurrentSystemPrompt(ctx.messages);
     const note = before[step];
-    const input = kind === "link" ? system : text(ctx.messages);
+    const input = text(ctx.messages);
     assert.ok(input.includes(`"source":{"id":"${note.id}"`), input);
     calls.push(note.id);
     return reply;
@@ -805,11 +824,10 @@ for (const kind of ["link", "consolidate"]) test(`${kind} retries an overloaded 
     response(0, fauxAssistantMessage("", { stopReason: "error", errorMessage: overload })), response(0, noChange),
     response(1, failedTool), response(1, failedTool), response(2, noChange),
   ]);
-  await session.prompt(`/psm-${kind} global`);
+  await session.prompt("/psm-consolidate global");
   assert.deepEqual(calls, [before[0].id, before[0].id, before[1].id, before[1].id, before[2].id]);
   assert.ok(alerts.some(([message, level]) => level === "info" && message.includes("Skipped 1 note")));
   assert.ok(!alerts.some(([, level]) => level === "error"));
-  if (kind === "link") assert.deepEqual((await store.list("global", true)).map(({ id }) => id), [before[1].id]);
   await session.reload();
   const raw = await readFile(join(directory, "smart-mem.log"), "utf8");
   const events = raw.trim().split("\n").map(JSON.parse);
@@ -1044,7 +1062,8 @@ test("manual linking, reclassification, and both cleanup passes trace decisions 
   const run = async (debugLogging) => {
     await new SettingsFile(directory).update({ debugLogging });
     const malformed = fauxAssistantMessage(fauxToolCall("psm_select_links", { text: "Private invalid decision" }));
-    faux.setResponses([malformed, unchanged("psm_select_links"), unchanged("psm_select_links")]);
+    if (debugLogging) await store.replace(note.id, `${note.text}.`, { model, values: [1, ...Array(dimensions - 1).fill(0)] });
+    faux.setResponses([malformed, linkReply()]);
     await session.prompt("/psm-link global");
     faux.setResponses([fauxAssistantMessage(fauxToolCall("psm_reclassify_batch", { updates: [{ id: note.id, kind: debugLogging ? "guideline" : note.kind }] }))]);
     await session.prompt("/psm-reclassify global");
@@ -1054,14 +1073,14 @@ test("manual linking, reclassification, and both cleanup passes trace decisions 
     return (await readFile(join(directory, "smart-mem.log"), "utf8")).trim().split("\n").map(JSON.parse);
   };
   const off = await run(false);
-  assert.ok(off.some(({ event }) => event === "maintenance.note_failed"));
+  assert.ok(off.some(({ event }) => event === "maintenance.batch_failed"));
   assert.ok(!off.some(({ level }) => level === "debug"));
   assert.doesNotMatch(JSON.stringify(off), /Private maintenance note|Private maintenance guidance|Private invalid decision/);
   const debug = (await run(true)).filter(({ level }) => level === "debug");
   const link = debug.filter(({ event }) => event.startsWith("linking."));
-  assert.deepEqual(link.filter(({ event }) => event === "linking.request").map(({ attempt }) => attempt), [1, 2, 1]);
-  assert.deepEqual(link.filter(({ event }) => event === "linking.result").map(({ result }) => result), [{ linked: [] }, { linked: [] }]);
-  assert.ok(link.some(({ input }) => input && [input.source, ...input.candidates].some(({ text }) => text === body)));
+  assert.deepEqual(link.filter(({ event }) => event === "linking.request").map(({ attempt }) => attempt), [1, 2]);
+  assert.deepEqual(link.filter(({ event }) => event === "linking.result").map(({ result }) => result), [{ links: [], changes: 0, checked: [note.id] }]);
+  assert.ok(link.some(({ input }) => input?.notes.some(({ text }) => text === body)));
   assert.match(JSON.stringify(link), /Private invalid decision/);
   assert.doesNotMatch(JSON.stringify(link.filter(({ event }) => event === "linking.request")), /Private linking conversation/);
   const decisions = debug.filter(({ event }) => event.startsWith("maintenance.decision."));
@@ -1236,7 +1255,7 @@ test("reclassify can find past owner intent before submitting kind-only updates"
   const { session, faux, store, note, archive, cwd, errors, alerts } = await fixture(t);
   const vector = { model: models[0].model, values: [1, ...Array(models[0].dimensions - 1).fill(0)] };
   const other = await store.add({ scope: "global", kind: "preference", text: "Use the kiwi fixture" }, vector);
-  await store.link(note.id, other.id);
+  await store.saveLinks([note, other], [linkPair(note, other)], []);
   await store.reinforce(note.id, "fixture-incident");
   const before = await store.read(note.id);
   const standing = "From now on, always verify release checks using the exit status.";
@@ -1276,34 +1295,141 @@ test("reclassify can find past owner intent before submitting kind-only updates"
   assert.deepEqual(errors, []);
 });
 
-test("link command and opt-in batches judge stored embeddings with active model", async (t) => {
-  const { session, note, faux, directory, store, errors, alerts } = await fixture(t);
+test("manual and automatic linking judge all eligible targets and revisit only pending sources", async (t) => {
+  const { session, note, faux, directory, cwd, store, errors, alerts } = await fixture(t);
   const { model, dimensions } = models[0];
-  const embedding = { model, values: Array.from({ length: dimensions }, (_, i) => i === 0 ? 1 : 0) };
-  const second = await store.add({ scope: "global", kind: "note", text: "Verify npm exit status when checks fail" }, embedding);
-  await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
-  const judged = [];
-  const judge = (ctx) => {
-    const prompt = getCurrentSystemPrompt(ctx.messages);
-    assert.match(prompt, /Judge candidate memory pairs/);
-    const { source, candidates } = JSON.parse(prompt.trim().split("\n").at(-1));
-    judged.push(source.id);
-    return fauxAssistantMessage(fauxToolCall("psm_select_links", { ids: source.id === note.id ? [candidates[0].id] : [] }));
-  };
-  faux.setResponses([judge, judge]);
+  const vector = { model, values: [1, ...Array(dimensions - 1).fill(0)] };
+  const orthogonal = { model, values: [0, 1, ...Array(dimensions - 2).fill(0)] };
+  const path = join(directory, "db");
+  const project = new MemoryStore(await resolveProject(cwd, path), path);
+  const other = new MemoryStore("excluded-project", path);
+  const shared = await store.add({ scope: "global", kind: "note", text: "A green CI badge can come from a job that skipped its test step" }, orthogonal);
+  const local = await project.add({ scope: "project", kind: "note", text: "CI skips test stages when the fixture is missing" }, vector);
+  const excluded = await other.add({ scope: "project", kind: "note", text: local.text }, vector);
+  const settings = new SettingsFile(directory);
+  await settings.update({ initialMessages: 100, periodicTurns: 100 });
+  const seen = [];
+  const judge = (...links) => (ctx) => { seen.push(linkInput(ctx)); return linkReply(links); };
+  const ids = (notes) => new Set(notes.map(({ id }) => id));
+  faux.setResponses([judge(linkPair(local, shared))]);
+  await session.prompt("/psm-link");
+  assert.deepEqual(seen[0].sourceIds, [local.id]);
+  assert.deepEqual(ids(seen[0].notes), ids([local, note, shared]));
+  assert.deepEqual(await project.related(local.id), [shared]);
+  assert.deepEqual(await project.related(shared.id), []);
+  assert.deepEqual((await project.linkingSnapshot("project")).sources, []);
+  assert.deepEqual((await other.linkingSnapshot("project")).sources, [excluded]);
+
+  faux.setResponses([judge(linkPair(note, shared))]);
   await session.prompt("/psm-link global");
-  assert.deepEqual(new Set(judged), new Set([note.id, second.id]));
-  assert.deepEqual(await store.related(note.id), [second]);
-  assert.deepEqual(await store.related(second.id), []);
-  assert.deepEqual(await store.list("global", true), []);
-  await new SettingsFile(directory).update({ autoLink: true, linkThreshold: 1 });
-  const third = await store.add({ scope: "global", kind: "preference", text: "Run checks after editing" }, embedding);
-  faux.setResponses([fauxAssistantMessage("Ordinary answer"), judge]);
+  assert.deepEqual(ids(seen[1].notes), ids([note, shared]));
+  assert.deepEqual(new Set(seen[1].sourceIds), ids([note, shared]));
+  assert.deepEqual(await store.related(note.id), [shared]);
+  assert.deepEqual(await project.related(shared.id), [note]);
+  const firstPassCalls = faux.state.callCount;
+  await session.prompt("/psm-link global");
+  assert.equal(faux.state.callCount, firstPassCalls);
+
+  await settings.update({ autoLink: true, linkThreshold: 2 });
+  const added = await store.add({ scope: "global", kind: "note", text: "Do not rely on a clean job badge" }, vector);
+  await store.replace(shared.id, shared.text, orthogonal);
+  faux.setResponses([fauxAssistantMessage("Ordinary answer")]);
+  await session.prompt("Turn below the automatic linking threshold");
+  assert.deepEqual((await store.linkingSnapshot("global")).sources, [added]);
+  const edited = await store.replace(shared.id, `${shared.text}.`, orthogonal);
+  faux.setResponses([fauxAssistantMessage("Ordinary answer"), judge(linkPair(added, note))]);
   await session.prompt("Turn to trigger background linking");
-  await waitFor(async () => (await store.list("global", true)).length === 0, "automatic linking");
-  assert.deepEqual(judged.slice(2), [third.id]);
+  await waitFor(async () => (await store.linkingSnapshot("global")).sources.length === 0, "automatic linking");
+  assert.deepEqual(new Set(seen[2].sourceIds), ids([added, edited]));
+  assert.deepEqual(ids(seen[2].notes), ids([added, edited, note]));
+  assert.deepEqual(ids(await store.related(note.id)), ids([added, edited]));
+  assert.deepEqual(await project.related(local.id), [edited]);
   assert.deepEqual(errors, []);
   assert.deepEqual(alerts.filter(([, level]) => level === "error"), []);
+});
+
+test("full linking rechecks checked sources in the selected scopes and counts only new links", async (t) => {
+  const { session, note, faux, directory, cwd, store, alerts, errors } = await fixture(t);
+  const { model, dimensions } = models[0];
+  const vector = { model, values: [1, ...Array(dimensions - 1).fill(0)] };
+  const path = join(directory, "db");
+  const project = new MemoryStore(await resolveProject(cwd, path), path);
+  const [a, b] = await Promise.all(["A", "B"].map((text) => project.add({ scope: "project", kind: "note", text }, vector)));
+  const shared = await store.add({ scope: "global", kind: "note", text: "Shared linking fixture" }, vector);
+  const ids = (...notes) => new Set(notes.map(({ id }) => id));
+  await project.saveLinks([a, b], [linkPair(a, b)], [a.id, b.id]);
+  await store.saveLinks([note, shared], [], [note.id, shared.id]);
+
+  await session.prompt("/psm-link global");
+  assert.equal(faux.state.callCount, 0);
+  const seen = [];
+  const judge = (...links) => (ctx) => { seen.push(linkInput(ctx)); return linkReply(links); };
+  faux.setResponses([judge(linkPair(b, a), linkPair(a, shared))]);
+  await session.prompt("/psm-link full");
+  assert.equal(seen.length, 1);
+  assert.deepEqual(new Set(seen[0].sourceIds), ids(a, b));
+  assert.deepEqual(ids(...seen[0].notes), ids(a, b, note, shared));
+  assert.deepEqual(ids(...await project.related(a.id)), ids(b, shared));
+  assert.deepEqual(await project.related(shared.id), []);
+  assert.equal(alerts.at(-1)[0], "Created 1 memory links");
+
+  faux.setResponses([judge(), judge(linkPair(note, shared))]);
+  await session.prompt("/psm-link global full");
+  assert.deepEqual(seen.slice(1).map(({ sourceIds }) => new Set(sourceIds)), [ids(a, b), ids(note, shared)]);
+  assert.deepEqual(ids(...await project.related(a.id)), ids(b, shared));
+  assert.deepEqual(await project.related(shared.id), [note]);
+  assert.equal(alerts.at(-1)[0], "Created 1 memory links");
+
+  faux.setResponses([fauxAssistantMessage("No tool call"), fauxAssistantMessage("Still no tool call")]);
+  await session.prompt("/psm-link full");
+  assert.match(alerts.at(-1)[0], /Skipped 2 notes/);
+  const calls = faux.state.callCount;
+  await session.prompt("/psm-link global");
+  assert.equal(faux.state.callCount, calls);
+  assert.deepEqual(errors, []);
+});
+
+test("split linking batches retry failures, keep incomplete sources pending, and deduplicate a rerun", async (t) => {
+  const { session, faux, store, directory, alerts, errors } = await fixture(t, { empty: true, fauxModels: shortLinkContext });
+  await addLongLinkNotes(store);
+  const seen = [];
+  const capture = (reply) => (ctx) => {
+    const members = linkMembers(ctx);
+    seen.push(members);
+    return reply(members);
+  };
+  faux.setResponses([
+    capture(() => fauxAssistantMessage("", { stopReason: "error", errorMessage: "Model overloaded" })),
+    capture((pair) => linkReply([linkPair(...pair)])),
+    capture(([source]) => linkReply([linkPair(source, source)])),
+    capture(([source]) => linkReply([linkPair(source, source)])),
+    capture(() => linkReply()),
+  ]);
+  await session.prompt("/psm-link global");
+  assert.deepEqual(seen.map((members) => members.length), [2, 2, 2, 2, 2]);
+  assert.deepEqual(seen[0], seen[1]);
+  assert.deepEqual(seen[2], seen[3]);
+  const failed = seen[2].map(({ id }) => id).sort();
+  assert.deepEqual((await store.linkingSnapshot("global")).sources.map(({ id }) => id).sort(), failed);
+  const [from, to] = seen[0];
+  const path = join(directory, "db");
+  const count = () => withDatabase(path, false, (db) => db.query("SELECT VALUE id FROM memory_link;").collect());
+  assert.equal((await count())[0].length, 1);
+  assert.deepEqual((await store.related(from.id)).map(({ id }) => id), [to.id]);
+  assert.ok(alerts.some(([message]) => message.includes("Skipped 2 notes")));
+
+  const again = ({ messages }) => {
+    const { notes, otherNotes = [], sourceIds } = linkInput({ messages });
+    const pair = [...notes, ...otherNotes];
+    const ids = pair.map(({ id }) => id);
+    if (!ids.includes(from.id) || !ids.includes(to.id)) return linkReply();
+    return linkReply([sourceIds.includes(to.id) ? linkPair(to, from) : linkPair(from, to)]);
+  };
+  faux.setResponses([again, again, again]);
+  await session.prompt("/psm-link global");
+  assert.deepEqual((await store.linkingSnapshot("global")).sources, []);
+  assert.equal((await count())[0].length, 1);
+  assert.deepEqual(errors, []);
 });
 
 test("compaction and injection refresh finish while a pre-compaction review is still running", { timeout: 10000 }, async (t) => {

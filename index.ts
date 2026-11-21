@@ -7,7 +7,8 @@ import { Archive, contentText } from "./src/archive.ts";
 import { embeddingDevice, models, type Device, type ModelPreset, type Progress } from "./src/embeddings.ts";
 import { migrateHermes } from "./src/hermes-migration.ts";
 import { readHermesSource } from "./src/hermes-source.ts";
-import { maintain, type MaintenanceResult } from "./src/maintenance.ts";
+import { consolidateMemories, type MaintenanceResult } from "./src/maintenance.ts";
+import { linkMemories, type LinkOptions } from "./src/linking.ts";
 import { reclassifyMemories, type BatchOptions } from "./src/maintenance-batch.ts";
 import { cleanupConflicts, cleanupMode, conflictGuidance } from "./src/conflict-cleanup.ts";
 import { Diagnostics } from "./src/diagnostics.ts";
@@ -37,13 +38,13 @@ function scopedMaintenance(project: string | undefined, args: string): Scope[] {
   return ["project"];
 }
 
-function consolidationOptions(project: string | undefined, args: string): { scopes: Scope[]; full: boolean } {
+function maintenanceOptions(project: string | undefined, args: string, command: typeof commands.link | typeof commands.consolidate): { scopes: Scope[]; full: boolean } {
   switch (args.trim().replace(/\s+/g, " ")) {
     case "": return { scopes: scopedMaintenance(project, ""), full: false };
     case "global": return { scopes: scopedMaintenance(project, "global"), full: false };
     case "full": return { scopes: scopedMaintenance(project, ""), full: true };
     case "global full": return { scopes: scopedMaintenance(project, "global"), full: true };
-    default: throw new Error(`Use /${commands.consolidate} [global] [full]`);
+    default: throw new Error(`Use /${command} [global] [full]`);
   }
 }
 
@@ -114,18 +115,26 @@ export default function smartMemory(pi: ExtensionAPI): void {
     try { return await track(activity.update); }
     finally { activity.clear(); }
   }
-  async function runMaintenance(options: Omit<Parameters<typeof maintain>[0], "onFailure" | "diagnostics">) {
-    const batch = { kind: options.kind, scopes: options.scopes.join(","), model: options.ctx.model?.id, automatic: !!options.automatic,
-      mode: options.kind === "consolidate" ? (options.full ? "full" : "incremental") : undefined };
+  async function runMaintenance(options: ({ kind: "link" } & Omit<LinkOptions, "onFailure" | "diagnostics">)
+    | ({ kind: "consolidate" } & Omit<Parameters<typeof consolidateMemories>[0], "onFailure" | "diagnostics">)) {
+    const batch = { kind: options.kind, scopes: options.scopes.join(","), model: options.ctx.model?.id, automatic: options.kind === "link" && !!options.automatic,
+      mode: options.full ? "full" : "incremental" };
     let started = false;
     const start = () => { if (!started) { started = true; void log.write("maintenance.start", batch); } };
-    if (!options.automatic) start();
+    if (!batch.automatic) start();
+    const progress = (message: string) => {
+      start();
+      void log.write("maintenance.progress", { ...batch, message });
+      options.progress(message);
+    };
     try {
-      const outcome = await maintain({ ...options, diagnostics: log, progress: (message) => {
-        start();
-        void log.write("maintenance.progress", { ...batch, message });
-        options.progress(message);
-      }, onFailure: (failure) => { void log.write("maintenance.note_failed", { ...batch, ...failure }, "warning"); } });
+      const outcome = options.kind === "link"
+        ? await linkMemories({ ...options, diagnostics: log, progress, onFailure: (scope, noteIds, attempt, reason) => {
+          void log.write("maintenance.batch_failed", { ...batch, scope, noteIds: noteIds.join(","), attempt, reason }, "warning");
+        } })
+        : await consolidateMemories({ ...options, diagnostics: log, progress, onFailure: (failure) => {
+          void log.write("maintenance.note_failed", { ...batch, ...failure }, "warning");
+        } });
       if (started) void log.write("maintenance.finish", { ...batch, ...outcome }, outcome.skipped ? "warning" : "info");
       return outcome;
     } catch (error) {
@@ -530,7 +539,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
       let activity: Activity | undefined;
       try {
         const result = await runMaintenance({ kind: "link", scopes: project ? ["project", "global"] : ["global"], automatic: true, ctx: modelContext, store, settings,
-          messages, signal, embed: (text, signal) => embed(text, false, signal), progress: (line) => {
+          messages, signal, progress: (line) => {
             activity ??= begin(ctx, title);
             activity?.update(line);
           } });
@@ -735,19 +744,19 @@ export default function smartMemory(pi: ExtensionAPI): void {
 
   for (const [kind, command] of [["link", commands.link], ["consolidate", commands.consolidate]] as const) {
     const link = kind === "link";
-    registerMaintenanceCommand(command, link ? "Build related-memory links" :
+    registerMaintenanceCommand(command, link ? "Build links for pending project memories. Options: global (pending in both scopes), full (all project), global full (all in both scopes)" :
       "Consolidate unchecked project memories. Options: global (unchecked in both scopes), full (all project), global full (all in both scopes)", (args, ctx) => {
-      const { scopes, full } = link ? { scopes: scopedMaintenance(project, args), full: false } : consolidationOptions(project, args);
+      const { scopes, full } = maintenanceOptions(project, args, command);
       const target = getStore();
       const messages = link ? withActiveContext(projected(ctx)) : [];
       const systemPrompt = link ? ctx.getSystemPrompt() : "";
       const modelContext = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel, getSystemPrompt: () => systemPrompt };
       return { kind, scopes, title: link ? "Building memory links" : "Consolidating memories", refresh: !link,
         summary: (changes) => link ? `Created ${changes} memory links` : `Updated ${changes} saved memories`,
-        run: async (report, signal) => runMaintenance({
-          kind, scopes, full, ctx: modelContext, store: target, settings: await file.read(), messages,
-          embed: (text, signal) => embed(text, false, signal), progress: report, signal,
-        }),
+        run: async (progress, signal) => {
+          const options = { scopes, full, ctx: modelContext, store: target, settings: await file.read(), progress, signal };
+          return link ? runMaintenance({ ...options, kind, messages }) : runMaintenance({ ...options, kind, embed: (text, signal) => embed(text, false, signal) });
+        },
       };
     });
   }

@@ -54,7 +54,7 @@ test("cleanup runs scoped guidance before conflicts, strips only proposed text a
   const globalKeep = await add("global", "note", "Friday is safe elsewhere.", 5000);
   const unrelated = new MemoryStore("unrelated", path);
   const outside = await unrelated.add({ scope: "project", kind: "note", text: "Unrelated repository" }, embedding);
-  await store.link(older.id, globalKeep.id);
+  await store.saveLinks([older, globalKeep], [{ from: older.id, to: globalKeep.id }], []);
   await store.reinforce(older.id, "first");
   await store.reinforce(older.id, "second");
   await store.reinforce(newer.id, "third");
