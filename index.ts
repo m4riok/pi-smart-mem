@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { convertToLlm, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -249,7 +250,30 @@ export default function smartMemory(pi: ExtensionAPI): void {
     const previous = reviewQueue;
     const loop = previous.then(async () => {
       signal?.throwIfAborted();
-      await runModel(ctx, messages, reviewTask(settings, trigger, request), reviewTools.filter(({ name }) => settings.reviewTools.includes(name)), {
+      const available = reviewTools.filter(({ name }) => settings.reviewTools.includes(name));
+      const reinforce = settings.reviewTools.includes(toolNames.reinforceMemory);
+      if (reinforce) {
+        const target = getStore();
+        const original = ctx.sessionManager.getBranch().flatMap((entry) => {
+          if (entry.type !== "message") return [];
+          const message = entry.message;
+          if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") return [];
+          return messages.some(({ role, timestamp }) => role === message.role && timestamp === message.timestamp) ? [entry] : [];
+        });
+        available.push(operation(toolNames.reinforceMemory,
+          "Boost an existing same-scope memory for a new incident. Supply a unique verbatim excerpt of the original evidence from this session.",
+          Type.Object({ id: Type.String({ minLength: 1 }), evidence: Type.String({ minLength: 1 }) }), async ({ id, evidence }, signal) => {
+            const quote = evidence.trim();
+            const matches = quote ? original.filter(({ message }) => "content" in message && contentText(message.content).includes(quote)) : [];
+            if (matches.length !== 1) throw new Error("Quote unique original evidence from an active session message");
+            const entry = matches[0];
+            const incident = createHash("sha256").update(JSON.stringify([entry.id, entry.message.timestamp])).digest("hex");
+            const saved = await target.reinforce(id, incident, signal);
+            return { value: { reinforced: saved }, saved };
+          }));
+      }
+      const task = reviewTask(settings, trigger, request);
+      await runModel(ctx, messages, reinforce ? `${task}\n\n${prompt(settings, "reinforce")}` : task, available, {
         settings, reviewer: true, signal, report, reasoning: pi.getThinkingLevel(),
       });
     });
@@ -477,7 +501,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => {
       await ctx.waitForIdle();
       try {
-        await openSettings(ctx, file, reviewTools.map(({ name }) => name), {
+        await openSettings(ctx, file, [...reviewTools.map(({ name }) => name), toolNames.reinforceMemory], {
           model: () => activePreset,
           setup: () => setup(ctx), device: (device) => setDevice(ctx, device),
           backfill: async () => {

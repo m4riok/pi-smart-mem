@@ -22,6 +22,7 @@ export const toolNames = {
   memoryAdd: `${prefix}memory_add`,
   memoryReplace: `${prefix}memory_replace`,
   memoryRemove: `${prefix}memory_remove`,
+  reinforceMemory: `${prefix}reinforce_memory`,
   memoryRelated: `${prefix}memory_related`,
   memoryGlobalPreferences: `${prefix}memory_global_preferences`,
   skillSearch: `${prefix}skill_search`,

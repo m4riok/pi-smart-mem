@@ -495,6 +495,29 @@ test("Debug logging is opt-in and records untruncated consolidation input, repli
   assert.deepEqual(errors, []);
 });
 
+test("review boosts once per incident, including independently verified evidence", async (t) => {
+  const { session, faux, note, store, errors, directory } = await fixture(t);
+  await new SettingsFile(directory).update({ initialMessages: 100 });
+  const correction = "No, use the exit status for this failed setup check.";
+  const evidence = "I reproduced a second bug: the suite failed with exit status 2 but its wrapper reported success.";
+  const boost = (evidence) => fauxToolCall("psm_reinforce_memory", { id: note.id, evidence });
+  faux.setResponses([
+    ({ messages }) => {
+      assert.ok(!getCurrentTools(messages).some(({ name }) => name === "psm_reinforce_memory"));
+      return fauxAssistantMessage("I'll check the exit status.");
+    },
+    fauxAssistantMessage(boost(correction)), fauxAssistantMessage("Reinforced after a fresh correction."),
+    fauxAssistantMessage(evidence), fauxAssistantMessage("The checks are complete."),
+    fauxAssistantMessage([boost(correction), boost(evidence)]), fauxAssistantMessage("Only the newly verified incident counted."),
+  ]);
+  await session.prompt(correction);
+  assert.deepEqual(await store.read(note.id), { ...note, weight: 1 });
+  await session.prompt("Check the other test wrapper.");
+  await session.prompt("Show the status.");
+  assert.deepEqual(await store.read(note.id), { ...note, weight: 2 });
+  assert.deepEqual(errors, []);
+});
+
 test("link command and opt-in batches judge stored embeddings with active model", async (t) => {
   const { session, note, faux, directory, store, errors, alerts } = await fixture(t);
   const { model, dimensions } = models[0];

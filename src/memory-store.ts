@@ -61,7 +61,7 @@ function validateEmbedding(space: EmbeddingSpace, embedding: Embedding): void {
 }
 
 const inventoryTables = ["memory", "smart_skill", "smart_pin"];
-const dataTables = ["memory_link", ...inventoryTables, "smart_transcript"];
+const dataTables = ["memory_link", "memory_incident", ...inventoryTables, "smart_transcript"];
 
 async function hasStoredData(db: Surreal): Promise<boolean> {
   const [found] = await db.query<[boolean]>(`RETURN ${dataTables.map((table) => `(SELECT VALUE id FROM ${table} LIMIT 1) != []`).join(" OR ")}`);
@@ -104,6 +104,7 @@ export class MemoryStore {
         DEFINE FIELD embedding ON memory TYPE option<array<float>>;
         DEFINE FIELD embedding_alt ON memory TYPE option<array<float>>;
         DEFINE FIELD reviewed ON memory TYPE bool DEFAULT false;
+        DEFINE TABLE memory_incident SCHEMALESS;
         DEFINE TABLE smart_pin SCHEMALESS;
         DEFINE TABLE smart_skill SCHEMALESS;
         DEFINE TABLE smart_transcript SCHEMALESS;
@@ -207,6 +208,21 @@ export class MemoryStore {
       const [rows] = await db.query<[StoredMemory[]]>(`UPDATE $id SET revisedAt = IF text != $text { time::millis() } ELSE { revisedAt }, text = $text, ${field} = $embedding
         WHERE ${visible} RETURN ${projection}`, this.#bind({ id: record(id), text, embedding: embedding.values }));
       return rows[0] && memory(rows[0]);
+    });
+  }
+
+  async reinforce(id: string, incident: string, signal?: AbortSignal): Promise<boolean> {
+    return this.#use(async (db) => {
+      if (!await this.#read(db, id)) return false;
+      const marker = new RecordId("memory_incident", incident);
+      const [existing] = await db.query<[RecordId | undefined]>("SELECT VALUE id FROM ONLY $marker", { marker });
+      if (existing) return false;
+      signal?.throwIfAborted();
+      await db.query(`BEGIN TRANSACTION;
+        CREATE $marker;
+        UPDATE $id SET weight += 1;
+        COMMIT TRANSACTION;`, { marker, id: record(id) });
+      return true;
     });
   }
 

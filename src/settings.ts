@@ -19,6 +19,7 @@ Do not add conflicting notes against standing guidance or within a scope. If a d
 Keep notes concise: durable takeaway first and minimum useful context. Reference files or symbols rather than copying code; include only a short essential snippet, never a long code block or a conversation retelling.`,
   skillWrite: `When ${toolNames.skillSave} is available, save only genuinely reusable procedures. Choose project scope for procedures specific to this project and global scope only when they apply across projects. Before saving, use ${toolNames.skillSearch} and read similar skills with ${toolNames.skillRead}. Skip if the procedure is already covered; revise an existing same-scope skill by ID when appropriate; create a new skill only when it is distinct.`,
   review: "Review only for durable information. Use the provided tools to check and act on evidence; choose add, revise, or skip. Never claim a write without a successful tool result. Finish with a brief rationale for your actions or skip.",
+  reinforce: `When a fresh owner correction or an independently verified new recurrence is already covered by an existing same-scope memory, use ${toolNames.reinforceMemory} instead of saving a duplicate. Quote the original evidence from this session, not a summary, reminder, retrieval, or re-review of the same incident. A suspicion is not evidence. Reinforcement never changes a memory's kind.`,
   correction: "Evaluate the triggering correction in conversation context and decide whether to add, revise, or skip under the write policy.",
   explicit: "Evaluate the user's direct request to save information. Apply the write policy; a save request alone does not guarantee a write.",
   periodic: "Look for durable information the foreground agent missed. Do not repeat writes already made.",
@@ -34,7 +35,7 @@ Reply with exactly one ${toolNames.consolidateNote} tool call, not prose, even i
   consolidateRetry: `The previous reply did not submit a decision. Call ${toolNames.consolidateNote} instead of replying in prose. To leave this note unchanged, call it with {"ids":[]} and omit text.`,
 };
 export type PromptKey = keyof typeof prompts;
-export const defaultReviewTools = [toolNames.memorySearch, toolNames.memoryRead, toolNames.memoryAdd, toolNames.memoryReplace, toolNames.skillSearch, toolNames.skillRead];
+export const defaultReviewTools = [toolNames.memorySearch, toolNames.memoryRead, toolNames.memoryAdd, toolNames.memoryReplace, toolNames.reinforceMemory, toolNames.skillSearch, toolNames.skillRead];
 export const defaults = {
   device: "cpu" as Device, initialMessages: 10, periodicTurns: 10, periodicCalls: 15, flushSeconds: 60,
   autoLink: false, debugLogging: false, linkThreshold: 10, include: [] as string[], exclude: [] as string[],
