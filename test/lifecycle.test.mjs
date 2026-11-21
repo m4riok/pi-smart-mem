@@ -326,7 +326,11 @@ test("Pi runs user-triggered and periodic reviews and adds independent, repeatab
     fauxAssistantMessage("Second answer"),
     (ctx) => {
       seen.push("correction");
-      assert.match(getCurrentSystemPrompt(ctx.messages), /Correction task fixture/);
+      const system = getCurrentSystemPrompt(ctx.messages);
+      assert.match(system, /Correction task fixture/);
+      assert.match(system, /compare the detail against the saved note itself/);
+      assert.match(system, /lacks a durable qualification, condition, or outcome, use psm_memory_replace/);
+      assert.match(system, /Use psm_reinforce_memory only when the existing same-scope note already fully covers the durable information/);
       assert.match(text(ctx.messages), /First historical detail/);
       assert.match(text(ctx.messages), /No, use pnpm/);
       assert.doesNotMatch(getCurrentTools(ctx.messages).map((tool) => tool.name).join(" "), /psm_memory_remove|bash/);
