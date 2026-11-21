@@ -7,15 +7,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { stripVTControlCharacters } from "node:util";
 import { getCurrentSystemPrompt, getCurrentTools, fauxProvider, fauxAssistantMessage, fauxToolCall, contentText } from "@earendil-works/pi-ai";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, initTheme, ModelRuntime, SessionManager, SettingsManager, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { getKeybindings, KeybindingsManager, setKeybindings } from "@earendil-works/pi-tui";
 import { Archive } from "../src/archive.ts";
 import { withDatabase } from "../src/database.ts";
 import { models } from "../src/embeddings.ts";
 import { openSocketDirectory } from "../src/embedding-protocol.ts";
 import { MemoryStore } from "../src/memory-store.ts";
 import { resolveProject } from "../src/project.ts";
-import { SettingsFile } from "../src/settings.ts";
+import { prompts, SettingsFile } from "../src/settings.ts";
 
 const hermesNames = ["memory_add", "memory_replace", "memory_remove", "session_search", "memory_search"];
 
@@ -338,6 +340,11 @@ test("Pi runs user-triggered and periodic reviews and adds independent, repeatab
     },
     fauxAssistantMessage("Third answer"),
     (ctx) => {
+      seen.push("initial");
+      assert.match(getCurrentSystemPrompt(ctx.messages), /Injection task fixture/);
+      return fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [note.id] }));
+    },
+    (ctx) => {
       seen.push("explicit");
       assert.match(getCurrentSystemPrompt(ctx.messages), /Explicit task fixture/);
       assert.match(text(ctx.messages), /Remember this: use fixtures/);
@@ -345,11 +352,6 @@ test("Pi runs user-triggered and periodic reviews and adds independent, repeatab
       assert.ok(names.includes("psm_memory_remove"));
       assert.ok(!names.includes("psm_skill_save"));
       return fauxAssistantMessage(fauxToolCall("psm_memory_remove", { id: removable.id }));
-    },
-    (ctx) => {
-      seen.push("initial");
-      assert.match(getCurrentSystemPrompt(ctx.messages), /Injection task fixture/);
-      return fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [note.id] }));
     },
     fauxAssistantMessage("Removed obsolete fixture memory"),
     (ctx) => {
@@ -366,8 +368,7 @@ test("Pi runs user-triggered and periodic reviews and adds independent, repeatab
   await file.update({ reviewTools: [...(await file.read()).reviewTools, "skill_save", "memory_remove"] });
   await session.prompt("Remember this: use fixtures for regression checks.");
   await waitForReviews(sessionManager, 3);
-  assert.deepEqual(seen.filter((stage) => stage !== "initial"), ["correction", "explicit", "periodic"]);
-  assert.equal(seen.filter((stage) => stage === "initial").length, 1);
+  assert.deepEqual(seen, ["correction", "initial", "explicit", "periodic"]);
   assert.deepEqual(rows(sessionManager).map(({ trigger, status }) => [trigger, status]), [["correction", "Skipped"], ["explicit", "Saved · 1"], ["periodic", "Skipped"]]);
   assert.equal(await store.read(removable.id), undefined);
   assert.equal(injections(sessionManager).length, 1);
@@ -381,6 +382,117 @@ test("Pi runs user-triggered and periodic reviews and adds independent, repeatab
   assert.equal((await archive.searchTranscripts("historical")).length, 1);
   assert.deepEqual(errors, []);
   assert.deepEqual(alerts.filter(([, level]) => level === "error"), []);
+});
+
+test("interactive manual injection shares the review queue without blocking chat", { timeout: 10000 }, async (t) => {
+  let panel;
+  const { session, note, faux, directory, sessionManager, errors } = await fixture(t, { mode: "tui", setWidget: (key, build) => {
+    if (key === "smart-mem") panel = build?.({ requestRender() {} }, { fg: (_color, text) => text });
+  } });
+  await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
+  const review = Promise.withResolvers();
+  const selection = Promise.withResolvers();
+  const reviewDone = fauxAssistantMessage("Nothing to save");
+  const selected = fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [note.id] }));
+  let selectorInput;
+  let nextPromptHadInjection;
+  try {
+    faux.setResponses([
+      fauxAssistantMessage("Correction acknowledged"),
+      () => review.promise,
+      fauxAssistantMessage("Replied before selection started"),
+      ({ messages }) => { selectorInput = text(messages); return selection.promise; },
+      ({ messages }) => {
+        nextPromptHadInjection = messages.some((message) => "content" in message && contentText(message.content).includes(note.text));
+        return fauxAssistantMessage("Replied while selection was running");
+      },
+    ]);
+    await session.prompt("No, use the actual exit status.");
+    await session.prompt("/psm-inject");
+    assert.match(panel.render(120).join("\n"), /Queued: Selecting relevant memories/);
+    await session.prompt("Chat before selection starts");
+    assert.equal(selectorInput, undefined);
+    review.resolve(reviewDone);
+    await waitFor(() => selectorInput !== undefined, "queued injection to start");
+    assert.match(selectorInput, /No, use the actual exit status/);
+    assert.doesNotMatch(selectorInput, /Chat before selection starts/);
+    await session.prompt("Chat while selection is running");
+    assert.equal(nextPromptHadInjection, false);
+    assert.deepEqual(injections(sessionManager), []);
+    selection.resolve(selected);
+    await waitFor(() => injections(sessionManager).length === 1, "selected memory to be injected");
+    assert.ok(injections(sessionManager)[0].content.includes(note.text));
+    assert.deepEqual(errors, []);
+  } finally {
+    review.resolve(reviewDone);
+    selection.resolve(selected);
+  }
+});
+
+test("manual injection treats clean empty and omitted selections alike but reports failures", async (t) => {
+  const { session, faux, alerts, sessionManager, directory, errors } = await fixture(t);
+  const logPath = join(directory, "smart-mem.log");
+  faux.setResponses([
+    fauxAssistantMessage("No applicable memories"),
+    fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [] })),
+    fauxAssistantMessage(fauxToolCall("psm_memory_search", { limit: "fixture-private-argument" })),
+    fauxAssistantMessage("Could not search"),
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "Selector service unavailable" }),
+  ]);
+  await session.prompt("/psm-inject");
+  await session.prompt("/psm-inject");
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(alerts.filter(([message, level]) => level === "info" && message === "No relevant memories selected").length, 2);
+  assert.deepEqual(alerts.filter(([, level]) => level === "error"), []);
+  await session.prompt("/psm-inject");
+  await session.prompt("/psm-inject");
+  const failures = alerts.filter(([, level]) => level === "error").map(([message]) => message);
+  assert.equal(failures.length, 2);
+  assert.match(failures[0], /psm_memory_search.*query/s);
+  assert.match(failures[1], /Selector service unavailable/);
+  const outcomes = async () => (await readFile(logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line)).filter(({ event }) => event === "injection.finish");
+  await waitFor(async () => (await outcomes()).length === 2, "both empty injection outcomes in diagnostics");
+  assert.deepEqual((await outcomes()).map(({ manual, selected }) => [manual, selected]), [[true, 0], [true, 0]]);
+  assert.doesNotMatch(failures[0], /Received arguments|fixture-private-argument/);
+  assert.doesNotMatch(await readFile(logPath, "utf8"), /Received arguments|fixture-private-argument/);
+  assert.deepEqual(injections(sessionManager), []);
+  assert.deepEqual(errors, []);
+});
+
+test("explicit review waits for a foreground save and sees its confirmed result", { timeout: 10000 }, async (t) => {
+  const { session, faux, directory, sessionManager, store } = await fixture(t);
+  const settings = new SettingsFile(directory);
+  await settings.update({ initialMessages: 100, periodicTurns: 100 });
+  const worker = await pausedEmbeddingWorker(directory);
+  try {
+    const draft = { scope: "global", kind: "note", text: "Fixture polling stops after the fifth consecutive connection error." };
+    let saved;
+    let reviewContext;
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("psm_memory_search", { query: "polling connection errors" })),
+      fauxAssistantMessage(fauxToolCall("psm_memory_add", draft)),
+      ({ messages }) => {
+        saved = JSON.parse(contentText(messages.find((message) => message.role === "toolResult" && message.toolName === "psm_memory_add").content));
+        return fauxAssistantMessage("Saved in the foreground.");
+      },
+      ({ messages }) => {
+        reviewContext = messages;
+        return fauxAssistantMessage("Already saved by the foreground agent.");
+      },
+    ]);
+    const turn = session.prompt(`Remember this: ${draft.text}`);
+    await worker.started;
+    worker.resume();
+    await turn;
+    await waitForReviews(sessionManager, 1);
+    const reviewResults = reviewContext.filter((message) => message.role === "toolResult" && message.toolName === "psm_memory_add");
+    assert.equal(reviewResults.length, 1);
+    assert.ok(contentText(reviewResults[0].content).includes(saved.result.id));
+    assert.ok(reviewContext.some((message) => message.role === "assistant" && contentText(message.content).includes("Saved in the foreground.")));
+    assert.equal(saved.saved, true);
+    assert.equal((await store.list("global")).filter(({ text }) => text === draft.text).length, 1);
+    assert.deepEqual(rows(sessionManager).map(({ trigger, status }) => [trigger, status]), [["explicit", "Skipped"]]);
+  } finally { await worker.close(); }
 });
 
 test("foreground receives skill guidance and can choose project or global scope", async (t) => {
@@ -551,6 +663,7 @@ for (const reason of ["quit", "reload"]) test(`${reason} cancels review and disc
   await session.prompt("No, use the fixture instead.");
   const signal = await started.promise;
   await session.prompt("/psm-consolidate global");
+  await session.prompt("/psm-inject");
   if (reason === "reload") await session.reload();
   else await session.extensionRunner.emit({ type: "session_shutdown", reason });
   assert.equal(signal.aborted, true);
@@ -558,6 +671,7 @@ for (const reason of ["quit", "reload"]) test(`${reason} cancels review and disc
   await returned.promise;
   assert.deepEqual(await store.read(note.id), note);
   assert.deepEqual(rows(sessionManager), []);
+  assert.deepEqual(injections(sessionManager), []);
   assert.equal(faux.state.callCount, 7);
   assert.deepEqual(errors, []);
 });
@@ -604,6 +718,35 @@ test("interactive Memory panel reports foreground tools and reviews without repl
   await waitForReviews(sessionManager, 1);
   assert.ok(panel.render(100).some((line) => line.includes("Memory review · Skipped")));
   assert.equal(rows(sessionManager).at(-1).rationale, "Not a durable change");
+  const review = sessionManager.getEntries().find((entry) => entry.customType === "smart-mem-review");
+  assert.equal(session.extensionRunner.getEntryRenderer(review.customType)(review, { expanded: false }), undefined);
+
+  initTheme("dark", false);
+  const previousBindings = getKeybindings();
+  t.after(() => setKeybindings(previousBindings));
+  setKeybindings(new KeybindingsManager({ "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } }));
+  const entries = sessionManager.getEntries();
+  const result = entries.find(({ message }) => message?.role === "toolResult" && message.toolName === "psm_memory_read").message;
+  const name = result.toolName;
+  const row = new ToolExecutionComponent(name, result.toolCallId, { id: note.id }, {}, session.extensionRunner.getToolDefinition(name), { requestRender() {} });
+  row.updateResult(result);
+  const render = (width) => row.render(width).map(stripVTControlCharacters).map((line) => line.trim()).filter(Boolean);
+  const collapsed = render(100);
+  assert.equal(collapsed.length, 2);
+  assert.equal(collapsed[0], `psm_memory_read id=${JSON.stringify(note.id)}`);
+  assert.match(collapsed[1], /^Finished.*ctrl\+o to expand/i);
+  assert.doesNotMatch(collapsed.join("\n"), /Use exit status/);
+  const narrow = render(36);
+  assert.equal(narrow.length, 2);
+  assert.match(narrow[0], /^psm_memory_read id=.*(?:\.\.\.|…)$/u);
+  assert.ok(!narrow[0].includes(note.id));
+  row.setExpanded(true);
+  const expanded = render(100).join("\n");
+  assert.ok(expanded.includes(`Arguments: ${JSON.stringify({ id: note.id })}`));
+  assert.match(expanded, /Result: .*Use exit status/);
+  assert.doesNotMatch(expanded, /to expand/i);
+  row.setExpanded(false);
+  assert.deepEqual(render(100), collapsed);
   assert.deepEqual(errors, []);
 });
 
@@ -954,14 +1097,14 @@ test("review deduplicates cited evidence but accepts identical corrections for s
       assert.deepEqual(evidenceIds(messages, "user", correction), [undefined]);
       return fauxAssistantMessage(fauxToolCall("psm_memory_read", { id: echo.id }));
     },
+    fauxAssistantMessage("I found the earlier setup check."),
     ({ messages }) => {
       [originalId] = evidenceIds(messages, "user", correction);
       [echoId] = evidenceIds(messages, "toolResult", correction);
       return fauxAssistantMessage(boost(originalId, correction));
     },
     fauxAssistantMessage("Reinforced after a fresh correction."),
-    fauxAssistantMessage("I checked the exit status."),
-    fauxAssistantMessage("That's the same setup check."),
+    fauxAssistantMessage("I checked the exit status for the same setup check."),
     ({ messages }) => {
       assert.match(getCurrentSystemPrompt(messages), /A correction trigger alone does not establish a new incident/);
       return fauxAssistantMessage(boost(originalId, correction));
@@ -989,6 +1132,7 @@ test("review deduplicates cited evidence but accepts identical corrections for s
   await session.prompt(correction);
   await waitForReviews(sessionManager, 2);
   assert.deepEqual(await store.read(note.id), { ...note, weight: 1 });
+  assert.equal(rows(sessionManager)[1].calls[0].arguments.messageId, originalId);
   await session.prompt("Did the next setup check pass?");
   await session.prompt(correction);
   await waitForReviews(sessionManager, 3);
@@ -1047,20 +1191,78 @@ test("cleanup guidance-only dispatches a scoped decision without running memory 
   assert.deepEqual(errors, []);
 });
 
-test("reclassify batches scoped memories and changes only kind", async (t) => {
-  const { session, faux, store, note, errors, alerts } = await fixture(t);
+test("foreground saves, automatic review, and reclassify share the default rubric and its override", async (t) => {
+  const { session, sessionManager, faux, directory, errors } = await fixture(t);
+  const settings = new SettingsFile(directory);
+  await settings.update({ initialMessages: 100, periodicTurns: 100 });
+  const override = "Use the owner-edited classification rubric.";
+  const seen = [];
+  for (const [index, rubric] of [prompts.classification, override].entries()) {
+    if (index) await settings.update({ prompts: { classification: override } });
+    faux.setResponses([
+      ({ messages }) => {
+        seen.push({ prompt: getCurrentSystemPrompt(messages), tools: getCurrentTools(messages) });
+        return fauxAssistantMessage("Foreground response");
+      },
+      ({ messages }) => {
+        seen.push({ prompt: messages[0].sections?.["smart-mem-task"], tools: getCurrentTools(messages) });
+        return fauxAssistantMessage("No new durable information");
+      },
+      ({ messages }) => {
+        seen.push({ prompt: getCurrentSystemPrompt(messages), tools: getCurrentTools(messages) });
+        return fauxAssistantMessage(fauxToolCall("psm_reclassify_batch", { updates: [] }));
+      },
+    ]);
+    await session.prompt(`Remember this: use fixture ${index} for regression checks.`);
+    await waitForReviews(sessionManager, index + 1);
+    await session.prompt("/psm-reclassify global");
+    const [foreground, review, reclassify] = seen.slice(index * 3);
+    for (const observation of [foreground, review, reclassify]) {
+      assert.ok(observation.prompt.includes(rubric));
+      if (index) assert.ok(!observation.prompt.includes(prompts.classification));
+    }
+    assert.ok(foreground.tools.some(({ name }) => name === "psm_memory_add"));
+    assert.match(review.prompt, /Explicit task fixture/);
+    assert.match(reclassify.prompt, /If the available evidence does not clearly support a different kind, keep the current kind/);
+  }
+  assert.deepEqual(errors, []);
+});
+
+test("reclassify can find past owner intent before submitting kind-only updates", async (t) => {
+  const { session, faux, store, note, archive, cwd, errors, alerts } = await fixture(t);
   const vector = { model: models[0].model, values: [1, ...Array(models[0].dimensions - 1).fill(0)] };
-  const other = await store.add({ scope: "global", kind: "note", text: "Other global memory" }, vector);
+  const other = await store.add({ scope: "global", kind: "preference", text: "Use the kiwi fixture" }, vector);
   await store.link(note.id, other.id);
   await store.reinforce(note.id, "fixture-incident");
   const before = await store.read(note.id);
-  faux.setResponses([({ messages }) => {
-    const { notes } = JSON.parse(text(messages));
-    assert.deepEqual(new Set(notes.map(({ id }) => id)), new Set([note.id, other.id]));
-    assert.deepEqual(getCurrentTools(messages).map(({ name }) => name), ["psm_reclassify_batch"]);
-    return fauxAssistantMessage(fauxToolCall("psm_reclassify_batch", { updates: [{ id: note.id, kind: "guideline" }] }));
-  }]);
+  const standing = "From now on, always verify release checks using the exit status.";
+  const historical = SessionManager.create(cwd, join(cwd, "previous"));
+  historical.appendMessage({ role: "user", content: standing, timestamp: Date.now() });
+  await archive.index(historical.getSessionFile(), [historical.getHeader(), ...historical.getEntries()]);
+  const searchResults = (messages) => messages.filter(({ role, toolName }) => role === "toolResult" && toolName === "psm_session_search")
+    .map(({ content }) => JSON.parse(contentText(content)).result.map(({ role, text }) => ({ role, text })));
+  const seen = [];
+  faux.setResponses([
+    ({ messages }) => {
+      seen.push({ notes: JSON.parse(text(messages)).notes, tools: getCurrentTools(messages), prompt: getCurrentSystemPrompt(messages) });
+      return fauxAssistantMessage(fauxToolCall("psm_session_search", { query: "exit status" }));
+    },
+    ({ messages }) => {
+      seen.push(searchResults(messages));
+      return fauxAssistantMessage(fauxToolCall("psm_session_search", { query: "kiwi" }));
+    },
+    ({ messages }) => {
+      seen.push(searchResults(messages));
+      return fauxAssistantMessage(fauxToolCall("psm_reclassify_batch", { updates: [{ id: note.id, kind: "guideline" }] }));
+    },
+  ]);
   await session.prompt("/psm-reclassify global");
+  const [request, hit, allSearches] = seen;
+  assert.deepEqual(new Set(request.notes.map(({ id }) => id)), new Set([note.id, other.id]));
+  assert.deepEqual(request.tools.map(({ name }) => name), ["psm_reclassify_batch", "psm_session_search"]);
+  assert.match(request.prompt, /use psm_session_search with a focused query to look for the owner's original direction/);
+  assert.deepEqual(hit, [[{ role: "user", text: standing }]]);
+  assert.deepEqual(allSearches, [...hit, []]);
   assert.deepEqual(await store.read(note.id), { ...before, kind: "guideline" });
   assert.deepEqual(await store.related(note.id), [other]);
   assert.ok(alerts.some(([message]) => message === "Reclassified 1 saved memories"));

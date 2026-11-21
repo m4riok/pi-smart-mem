@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Tool } from "@earendil-works/pi-ai";
+import type { JsonObject, Tool } from "@earendil-works/pi-ai";
+import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static, type TSchema } from "typebox";
-import type { Archive } from "./archive.ts";
+import { contentText, type Archive } from "./archive.ts";
 import { memoryKinds, type Embedding, type MemoryStore } from "./memory-store.ts";
 
 const text = Type.String({ minLength: 1 });
@@ -41,7 +42,12 @@ const oldToolNames = new Map(Object.values(toolNames).map((name) => [name.slice(
 export const currentToolName = (name: string) => oldToolNames.get(name) ?? name;
 export const lookupNames = [toolNames.memorySearch, toolNames.memoryRead, toolNames.memoryRelated, toolNames.memoryGlobalPreferences];
 
-export function memoryTools(getStore: () => MemoryStore, getArchive: () => Archive, embed: (text: string, query: boolean, signal?: AbortSignal) => Promise<Embedding>, sessionFile: () => string | undefined): Operation[] {
+export function sessionSearchTool(getArchive: () => Archive, sessionFile: () => string | undefined): Operation {
+  return operation(toolNames.sessionSearch, "Search text in indexed past Pi conversations.", Type.Object({ query: text }), async ({ query }) =>
+    ({ value: await getArchive().searchTranscripts(query, sessionFile()) }));
+}
+
+export function memoryTools(getStore: () => MemoryStore, getArchive: () => Archive, embed: (text: string, query: boolean, signal?: AbortSignal) => Promise<Embedding>): Operation[] {
   const output = async <T>(task: Promise<T>): Promise<Outcome> => ({ value: await task });
   return [
     operation(toolNames.memorySearch, "Find saved memories by keyword and meaning.", Type.Object({ query: text, limit, scope: Type.Optional(scope), kind: Type.Optional(memoryKind) }), async (args, signal) => {
@@ -50,7 +56,7 @@ export function memoryTools(getStore: () => MemoryStore, getArchive: () => Archi
       return { value: notes.map(({ project: _, ...note }) => ({ ...note, scope: note.scope === "project" ? "Project" : "Global" })) };
     }),
     operation(toolNames.memoryRead, "Read one saved memory by ID.", Type.Object({ id }), ({ id }) => output(getStore().read(id))),
-    operation(toolNames.memoryAdd, "Save a durable memory: guideline for clear owner-given standing direction, preference for a preferred default, or note for other durable information.", Type.Object({ scope, kind: memoryKind, text }), async (args, signal) => {
+    operation(toolNames.memoryAdd, "Save a durable memory. Choose its kind using the memory classification guidance.", Type.Object({ scope, kind: memoryKind, text }), async (args, signal) => {
       const value = await getStore().add(args, await embed(args.text, false, signal), signal);
       return { value, saved: true };
     }),
@@ -70,13 +76,39 @@ export function memoryTools(getStore: () => MemoryStore, getArchive: () => Archi
       const value = await getArchive().saveSkill(draft, id, signal);
       return { value, saved: !!value };
     }),
-    operation(toolNames.sessionSearch, "Search text in indexed past Pi conversations.", Type.Object({ query: text }), ({ query }) => output(getArchive().searchTranscripts(query, sessionFile()))),
   ];
 }
 
+function toolPreview(...lines: string[]) {
+  return { render: (width: number) => lines.map((line) => truncateToWidth(line, width)), invalidate() {} };
+}
+
+function terminalText(text: string) {
+  return text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+}
+
 export function registerTools(pi: ExtensionAPI, tools: Operation[]) {
-  for (const tool of tools) pi.registerTool({
+  for (const tool of tools) pi.registerTool<TSchema, { saved?: boolean }>({
     name: tool.name, label: tool.name, description: tool.description, parameters: tool.parameters as TSchema,
+    renderCall(args, theme, { expanded, isPartial, executionStarted }) {
+      const title = theme.fg("toolTitle", theme.bold(tool.name));
+      const pending = isPartial ? theme.fg("toolOutput", executionStarted ? "Running" : "Pending") : undefined;
+      if (expanded) {
+        const argumentsText = theme.fg("toolOutput", `Arguments: ${terminalText(JSON.stringify(args))}`);
+        return new Text([title, argumentsText, pending].filter(Boolean).join("\n"), 0, 0);
+      }
+      const preview = Object.entries(args as JsonObject).map(([key, value]) => `${JSON.stringify(key).slice(1, -1)}=${JSON.stringify(value)}`).join(" ");
+      const call = preview ? `${title} ${theme.fg("muted", terminalText(preview))}` : title;
+      return pending ? toolPreview(call, pending) : toolPreview(call);
+    },
+    renderResult(result, { expanded, isPartial }, theme, { isError, keyHint }) {
+      if (isPartial) return new Container();
+      const status = isError ? "Failed" : result.details?.saved === true ? "Saved" : result.details?.saved === false ? "Not saved" : "Finished";
+      const summary = theme.fg(isError ? "error" : "toolOutput", status);
+      if (!expanded) return toolPreview(`${summary} ${keyHint("app.tools.expand", "to expand")}`);
+      const output = theme.fg("toolOutput", `Result: ${terminalText(contentText(result.content))}`);
+      return new Text(`${summary}\n${output}`, 0, 0);
+    },
     async execute(_id, args, signal) {
       const { value, saved } = await tool.call(args, signal);
       return { content: [{ type: "text", text: resultText(value, saved) }], details: { saved } };

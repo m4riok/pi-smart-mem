@@ -201,13 +201,13 @@ export class MemoryStore {
     return this.#use((db) => this.#read(db, id));
   }
 
-  async readMany(ids: string[]): Promise<Memory[]> {
+  async readMany(ids: string[], signal?: AbortSignal): Promise<Memory[]> {
     if (!ids.length) return [];
     return this.#use(async (db) => {
       const [rows] = await db.query<[StoredMemory[]]>(`SELECT ${projection} FROM $ids WHERE ${visible}`, this.#bind({ ids: ids.map(record) }));
       const found = new Map(rows.map((row) => [row.id.id, memory(row)]));
       return ids.flatMap((id) => found.get(id) ?? []);
-    });
+    }, signal);
   }
 
   async replace(id: string, text: string, embedding: Embedding, signal?: AbortSignal): Promise<Memory | undefined> {

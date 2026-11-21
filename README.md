@@ -32,13 +32,13 @@ Automatic memory review runs in the main Pi session:
 
 | Trigger | Default behavior |
 | --- | --- |
-| **Explicit save request or recognized correction** | Queue a review at the end of the turn. |
-| **Periodic review** | After 10 turns or 15 assistant tool calls, once there are at least 3 user messages and 4 usable context messages. |
+| **Explicit save request or recognized correction** | Queue after the foreground run finishes, so the reviewer can see confirmed writes. |
+| **Periodic review** | After a non-aborted run, if at least 10 turns or 15 assistant tool calls have accumulated and there are at least 3 user messages and 4 usable context messages. |
 | **Before compaction** | Queue a review if the conversation has at least 6 user messages. Compaction does not wait. Once this review starts, it has 60 seconds by default. |
 
-Reviews, interactive maintenance, background setup and import, and automatic linking share one sequential background queue per session. The Memory panel shows running and queued work. Exit or reload cancels unfinished jobs without starting a final review. Changes already saved stay saved. Foreground memory tools still return their actual results.
+Reviews, manual injection, interactive maintenance, background setup and import, and automatic linking share one sequential background queue per session. The Memory panel shows running and queued work. Exit or reload cancels unfinished jobs without starting a final review. Changes already saved stay saved. Foreground memory tools still return their actual results.
 
-Expand a **Memory review** row to see what Pi saved, revised, or skipped and why.
+Use **Alt+U** in the Memory panel to see the latest review's decisions and tool details.
 
 ## Model calls and token usage
 
@@ -46,7 +46,7 @@ Expand a **Memory review** row to see what Pi saved, revised, or skipped and why
 
 Other features that make model calls:
 
-- **Memory injection:** Pi selects relevant notes once after 10 total user and assistant messages by default. It selects again after compaction if it previously injected notes. `/psm-inject` runs selection on demand. Injected notes become part of the conversation and can increase input tokens on later turns.
+- **Memory injection:** Pi selects relevant notes once after 10 total user and assistant messages by default. It selects again after compaction if it previously injected notes. `/psm-inject` queues selection on demand. Interactive chat can continue while it runs. If the model finishes normally without choosing any notes, nothing is injected and no error is shown. Injected notes become part of the conversation and can increase input tokens on later turns.
 - **Maintenance:** `/psm-link` asks the model which relationships to keep. `/psm-consolidate` asks it which notes to merge or shorten. Rewrites without a merge must save at least 30 characters and 5% of the original, or the note stays unchanged. Automatic linking is off by default; if enabled, it runs when a scope reaches 10 new unreviewed notes by default.
 
 Open `/psm-settings` to adjust thresholds and triggers. Reviews inherit the session model and reasoning level unless you choose separate settings.
@@ -80,7 +80,9 @@ Run `/psm-setup` or choose **Embedding model** in `/psm-settings` to check again
 
 Close other Pi sessions using Hermes or Smart Mem, then run `/psm-migrate-hermes` in a main Pi session. One run imports global and project memories, skills, and pins. `MEMORY.md` entries and failures import as notes; `USER.md` entries import as global preferences. Failures with a saved project tag stay project-scoped; untagged failures stay global. When available, Hermes creation dates initialize Smart Mem's revision timestamp. Project folders are matched automatically; the command reports IDs for imported projects it could not match. Hermes files stay unchanged. In interactive Pi, normal import runs in the background after any setup dialogs, with progress in the Memory panel. Leaving the session cancels work that has not reached the replacement transaction. The panel keeps the import result for 60 seconds. Unmatched project IDs remain available in `smart-mem.log`.
 
-`/psm-migrate-hermes force` runs in the foreground and **replaces existing Smart Mem data**, including memories, links, skills, pins, and the transcript index. Without `force`, migration refuses to replace a populated store. Neither form deletes Pi transcripts; use Smart Mem's transcript backfill to rebuild the index.
+`/psm-migrate-hermes force` runs in the foreground and **replaces existing Smart Mem data**, including memories, links, skills, pins, and the transcript index. Without `force`, migration refuses to replace a populated store. Neither form deletes Pi transcripts.
+
+After importing, run `/psm-reclassify` once in each imported project you want to review; append `global` on one run to include global memories. New saves already get a kind, so there is no need to run this routinely. If the original conversations are in Pi but not indexed yet, run `/psm-settings` → **Transcript index** → **Backfill Pi sessions** before reclassifying. Hermes import does not import transcripts.
 
 ## Database upgrades
 
@@ -92,13 +94,13 @@ Smart Mem looks up Git `origin` locally and uses `.pi/smart-mem-id` when the ori
 
 ## Keep, find, and clean up information
 
-The **🧠** panel stays above the editor. Its status bar animates while Smart Mem is working. The panel shows whether Smart Mem is active, separate Project and Global counts for memories, skills, and pins, plus running work and the latest result or error. Counts update at startup and after writes in this session. Informational results clear after five seconds by default; warnings and errors do not expire automatically. Press **Alt+U** to expand or hide available details. Tool results and detailed review entries remain in the conversation.
+The **🧠** panel stays above the editor. Its status bar animates while Smart Mem is working. The panel shows whether Smart Mem is active, separate Project and Global counts for memories, skills, and pins, plus running work and the latest result or error. Counts update at startup and after writes in this session. Informational results clear after five seconds by default; warnings and errors do not expire automatically. Press **Alt+U** to expand or hide available details. Automatic review entries stay in session history but appear only in the panel. Foreground Smart Mem calls show a compact argument preview and a muted result summary. Use Pi's tool expansion (Ctrl+O by default) to see the full arguments and result.
 
 - `/psm-pin <text>` adds standing instructions for this project. `/psm-pin global <text>` adds them across projects.
 - Ask Pi to save a reusable procedure as a skill. The main model checks for similar skills and decides whether the procedure belongs to this project or applies globally. Automatic memory review does not save skills.
 - Ask Pi to search past conversations for details that were never saved as memories. Transcript search uses a separate local index across projects. The **Transcript index** settings let you backfill existing Pi sessions or clear the index without deleting transcripts.
 - `/psm-consolidate` checks new, edited, or previously unchecked project memories. `global` includes global memories, `full` rechecks all project memories, and `global full` rechecks both scopes. In incremental mode, older checked notes still qualify as candidates within the same scope. Existing notes without a check marker are pending on the first run; failed checks stay pending.
 - `/psm-link` processes this project by default; append `global` to include global notes. In interactive Pi, linking and consolidation run in the background and show progress and results in the Memory panel above the editor. A failed note is retried once, then skipped and counted if it still fails. Leaving the session cancels remaining work.
-- `/psm-reclassify` reviews this project's memory kinds in batches. Append `global` to include global memories. It changes only kind, leaving text, weight, scope, revision date, and links intact.
+- `/psm-reclassify` is a one-time review after a Hermes import. It checks all memories in the current project in batches; append `global` to include global memories. It uses the same `classification` prompt as new saves (editable under **Model prompts**). Before promoting a memory to `guideline`, it can search indexed past Pi conversations with `psm_session_search` if the note alone doesn't establish a standing rule. A one-off instruction or approval is not enough. If the available evidence doesn't clearly support a different kind, the command keeps the current kind. It leaves text, weight, scope, revision date, and links intact.
 - `/psm-cleanup-conflicts` checks the current project and global memories. It compares each batch against applicable system and `AGENTS.md` guidance first, then compares similar memories within each scope. Project guidance cannot invalidate global memories. Bare `guidance-only` or `memory-only` runs just that pass. Guidance cleanup removes only conflicting content. For memory conflicts, the newer substantive position wins; unrelated details and links survive, and the highest weight is retained. Tied revisions stay unchanged.
 - **Diagnostics:** `~/.pi/agent/pi-smart-mem/smart-mem.log` (under `$PI_CODING_AGENT_DIR` when set) records Smart Mem operations, errors, and native embedding worker output as JSON lines. It rotates at 5 MiB and retains three archives (`.1` newest). `/psm-settings` → **Debug logging** is OFF by default. Turn it ON to trace manual linking, consolidation, reclassification, and both conflict-cleanup passes. Traces include the notes, shortlist or applicable guidance sent for judgment, plus the model reply and tool calls. Linking traces don't copy the conversation into the request log. Linking, reclassification, and conflict cleanup also log successful tool outcomes. These records can contain private memory text or guidance and remain in logs after turning debug OFF. Review logs before sharing.

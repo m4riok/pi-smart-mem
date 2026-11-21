@@ -2,7 +2,6 @@ import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { convertToLlm, getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Message } from "@earendil-works/pi-ai";
-import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Archive, contentText } from "./src/archive.ts";
 import { embeddingDevice, models, type Device, type ModelPreset, type Progress } from "./src/embeddings.ts";
@@ -16,7 +15,7 @@ import { commands } from "./src/commands.ts";
 import { JobQueue } from "./src/job-queue.ts";
 import { MemoryPanel, memoryPanelShortcut, type Activity, type Level } from "./src/memory-panel.ts";
 import { MemoryStore, type Scope } from "./src/memory-store.ts";
-import { lookupNames, memoryTools, operation, registerTools, toolNames } from "./src/memory-tools.ts";
+import { lookupNames, memoryTools, operation, registerTools, sessionSearchTool, toolNames } from "./src/memory-tools.ts";
 import { resolveProject } from "./src/project.ts";
 import { detectTrigger, injectionText, newReport, reviewTask, reviewTitle, runModel, type ModelContext, type RunReport, type Trigger, type UserTrigger } from "./src/review.ts";
 import { reviewEvidence } from "./src/review-evidence.ts";
@@ -186,7 +185,8 @@ export default function smartMemory(pi: ExtensionAPI): void {
       return worker.embed(model, embeddingDevice(model, settings.device), text, { query });
     }, signal);
   }
-  const tools = memoryTools(getStore, getArchive, embed, () => activeContext?.sessionManager.getSessionFile());
+  const sessionSearch = sessionSearchTool(getArchive, () => activeContext?.sessionManager.getSessionFile());
+  const tools = [...memoryTools(getStore, getArchive, embed), sessionSearch];
   const reviewTools = tools.filter(({ name }) => name !== toolNames.skillSave);
   registerTools(pi, main ? tools : reviewTools);
 
@@ -269,13 +269,13 @@ export default function smartMemory(pi: ExtensionAPI): void {
     return [...lastContext.actual, ...messages.slice(before.length)];
   }
 
-  async function inject(ctx: ExtensionContext, settings: Settings, messages: Message[], manual = false) {
+  async function inject(ctx: ExtensionContext, settings: Settings, messages: Message[]) {
     const action = () => selectInjection(ctx, settings, messages);
-    if (!manual && !hasPanel(ctx)) return action();
+    if (!hasPanel(ctx)) return action();
     return progress(ctx, "Selecting relevant memories", action);
   }
 
-  async function selectInjection(ctx: ExtensionContext, settings: Settings, messages: Message[]) {
+  async function selectInjection(ctx: ExtensionContext, settings: Settings, messages: Message[], manual?: { modelContext: ModelContext; signal: AbortSignal }) {
     const ids: string[] = [];
     let submitted = false;
     const available = tools.filter(({ name }) => lookupNames.includes(name));
@@ -284,13 +284,18 @@ export default function smartMemory(pi: ExtensionAPI): void {
       return { value: { selected: ids.length } };
     });
     const task = [prompt(settings, "precedence"), prompt(settings, "injection")].join("\n\n");
-    await runModel(ctx, messages, task, [...available, selection], { settings, signal: ctx.signal, done: () => submitted });
-    if (!submitted) throw new Error("Model did not submit a memory selection");
-    const notes = await getStore().readMany(ids);
+    const report = await runModel(manual?.modelContext ?? ctx, messages, task, [...available, selection], { settings, signal: manual?.signal ?? ctx.signal, done: () => submitted });
+    if (manual && !ids.length) {
+      const failure = report.calls.find(({ isError }) => isError);
+      if (failure) throw new Error(`${failure.name}: ${String(failure.result).split("\n\nReceived arguments:\n", 1)[0]}`);
+    }
+    if (!manual && !submitted) throw new Error("Model did not submit a memory selection");
+    const notes = await getStore().readMany(ids, manual?.signal);
+    manual?.signal.throwIfAborted();
     const { kept, overflow } = injectionText(notes.map(({ text }) => text));
     if (overflow) notify(ctx, "Memory injection exceeded 32 KiB. Remaining notes were not injected.", "warning");
-    else if (hasPanel(ctx)) panel.notice(kept.length ? `Injected ${kept.length} saved ${kept.length === 1 ? "memory" : "memories"}` : "No relevant memories selected");
-    void log.write("injection.finish", { selected: kept.length, overflow });
+    else if (hasPanel(ctx) && (kept.length || !manual)) panel.notice(kept.length ? `Injected ${kept.length} saved ${kept.length === 1 ? "memory" : "memories"}` : "No relevant memories selected");
+    void log.write("injection.finish", { selected: kept.length, overflow, manual: manual ? true : undefined });
     if (!kept.length) return undefined;
     return { customType: injectedType, content: `${prompt(settings, "injected")}\n\n${kept.join("\n\n")}`, display: false };
   }
@@ -394,6 +399,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
     const active = new Set(pi.getActiveTools());
     const memoryExposed = tools.some(({ name }) => active.has(name));
     const guidance = memoryExposed ? [prompt(settings, "precedence"), prompt(settings, "recall"), prompt(settings, "write")] : [];
+    if (active.has(toolNames.memoryAdd)) guidance.push(prompt(settings, "classification"));
     if (main && active.has(toolNames.skillSave)) guidance.push(prompt(settings, "skillWrite"));
     if (pins.length) guidance.push(...pins);
     if (guidance.length) return { systemPrompt: [event.systemPrompt, ...guidance].join("\n\n") };
@@ -410,17 +416,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
     data.rationale && `Reason: ${data.rationale}`, data.error && `Error: ${data.error}`,
   ].filter(Boolean).join("\n");
 
-  pi.registerEntryRenderer<ReviewRow>(reviewTitle, (entry, { expanded }, theme) => {
-    const box = new Box(1, 0);
-    const data = entry.data;
-    if (!data) return box;
-    box.addChild(new Text(theme.fg("accent", `Memory review · ${data.status}`), 0, 0));
-    if (expanded) {
-      // Do not interpret model-provided terminal escapes in the custom renderer.
-      box.addChild(new Text(reviewDetails(data).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ""), 0, 0));
-    }
-    return box;
-  });
+  pi.registerEntryRenderer<ReviewRow>(reviewTitle, () => undefined);
 
   pi.on("session_shutdown", async (event, ctx) => {
     jobs.stop();
@@ -469,28 +465,15 @@ export default function smartMemory(pi: ExtensionAPI): void {
 
   pi.on("turn_end", async (event, ctx) => {
     if (!activePreset) return;
+    turns++;
+    if (event.message.role === "assistant") calls += event.message.content.filter((part) => part.type === "toolCall").length;
+    if (initial || ctx.signal?.aborted) return;
     const entries = [];
     try {
       const settings = await file.read();
-      const active = event.context.contextMessages;
-      const branch = ctx.sessionManager.getBranch();
-      const chat = branch.flatMap((entry) => entry.type === "message" && isConversation(entry.message) ? [entry.message] : []);
-      const messages = withActiveContext(event.context.llmMessages);
-      turns++;
-      if (event.message.role === "assistant") calls += event.message.content.filter((part) => part.type === "toolCall").length;
-      for (const request of pending.splice(0)) {
-        if (!chat.some((m) => m.role === "user" && m.timestamp === request.timestamp)) continue;
-        queueReview(ctx, settings, request.kind, messages, request.text);
-      }
-      const due = turns >= settings.periodicTurns || calls >= settings.periodicCalls;
-      const enough = chat.filter(({ role }) => role === "user").length >= 3 && active.filter((m) => "content" in m && (contentText(m.content).trim() || (Array.isArray(m.content) && m.content.some(({ type }) => type === "image" || type === "toolCall")))).length >= 4;
-      if (due && enough && !ctx.signal?.aborted) {
-        queueReview(ctx, settings, "periodic", messages);
-        turns = 0;
-        calls = 0;
-      }
-      if (!initial && chat.length >= settings.initialMessages && !ctx.signal?.aborted) {
-        const addition = await inject(ctx, settings, messages);
+      const chat = ctx.sessionManager.getBranch().filter((entry) => entry.type === "message" && isConversation(entry.message));
+      if (chat.length >= settings.initialMessages && !ctx.signal?.aborted) {
+        const addition = await inject(ctx, settings, withActiveContext(event.context.llmMessages));
         ctx.signal?.throwIfAborted();
         initial = true;
         entries.push({ type: "custom" as const, customType: initialType });
@@ -513,31 +496,47 @@ export default function smartMemory(pi: ExtensionAPI): void {
       if (addition) pi.sendMessage(addition, { triggerTurn: false });
     } catch (error) { reportError(ctx, error); }
   });
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async (event, ctx) => {
     if (!activePreset) return;
     try {
       if (deferredImportIndex) deferredImportIndex.pending = true;
-      else await indexCurrent(ctx);
+      else await indexCurrent(ctx).catch((error) => reportError(ctx, error));
       const settings = await file.read();
-      if (settings.autoLink) {
-        const title = "Automatic linking";
-        const messages = withActiveContext(projected(ctx));
-        const systemPrompt = ctx.getSystemPrompt();
-        const modelContext: ModelContext = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel, getSystemPrompt: () => systemPrompt };
-        jobs.enqueue({ title, run: async (signal) => {
-          let activity: Activity | undefined;
-          try {
-            const result = await runMaintenance({ kind: "link", scopes: project ? ["project", "global"] : ["global"], automatic: true, ctx: modelContext, store, settings,
-              messages, signal, embed: (text, signal) => embed(text, false, signal), progress: (line) => {
-                activity ??= begin(ctx, title);
-                activity?.update(line);
-              } });
-            if (!signal.aborted) activity?.finish(`${title} · Created ${result.changes} memory links${skipSummary(result.skipped)}`);
-          } finally { activity?.clear(); }
-        } });
+      const due = !event.aborted && (turns >= settings.periodicTurns || calls >= settings.periodicCalls);
+      if (pending.length || due || settings.autoLink) {
+        const branch = ctx.sessionManager.getBranch();
+        const users = branch.flatMap((entry) => entry.type === "message" && entry.message.role === "user" ? [entry.message.timestamp] : []);
+        const active = ctx.sessionManager.buildSessionProjection().messages;
+        const messages = withActiveContext(convertToLlm(active));
+        for (const request of pending.splice(0)) {
+          if (users.includes(request.timestamp)) queueReview(ctx, settings, request.kind, messages, request.text);
+        }
+        if (due && users.length >= 3 && active.filter((m) => "content" in m && (contentText(m.content).trim() || (Array.isArray(m.content) && m.content.some(({ type }) => type === "image" || type === "toolCall")))).length >= 4) {
+          queueReview(ctx, settings, "periodic", messages);
+          turns = 0;
+          calls = 0;
+        }
+        if (settings.autoLink) queueAutoLink(ctx, settings, messages);
       }
     } catch (error) { reportError(ctx, error); }
   });
+
+  function queueAutoLink(ctx: ExtensionContext, settings: Settings, messages: Message[]) {
+    const title = "Automatic linking";
+    const systemPrompt = ctx.getSystemPrompt();
+    const modelContext: ModelContext = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel, getSystemPrompt: () => systemPrompt };
+    jobs.enqueue({ title, run: async (signal) => {
+      let activity: Activity | undefined;
+      try {
+        const result = await runMaintenance({ kind: "link", scopes: project ? ["project", "global"] : ["global"], automatic: true, ctx: modelContext, store, settings,
+          messages, signal, embed: (text, signal) => embed(text, false, signal), progress: (line) => {
+            activity ??= begin(ctx, title);
+            activity?.update(line);
+          } });
+        if (!signal.aborted) activity?.finish(`${title} · Created ${result.changes} memory links${skipSummary(result.skipped)}`);
+      } finally { activity?.clear(); }
+    } });
+  }
   registerCommand(commands.setup, {
     description: "Set up Smart Mem embeddings and storage",
     handler: async (_args, ctx) => {
@@ -646,14 +645,25 @@ export default function smartMemory(pi: ExtensionAPI): void {
   registerCommand(commands.inject, {
     description: "Select and inject relevant saved memories",
     handler: async (_args, ctx) => {
-      await ctx.waitForIdle();
-      try {
+      const background = ctx.mode === "tui";
+      await runManualJob(ctx, background ? "background" : "queued-response", () => {
         getStore();
-        const settings = await file.read();
-        const addition = await inject(ctx, settings, withActiveContext(projected(ctx)), true);
-        if (addition) pi.sendMessage(addition, { triggerTurn: false });
-        if (!hasPanel(ctx)) notify(ctx, addition ? "Injected relevant memories" : "No relevant memories selected");
-      } catch (error) { reportError(ctx, error); }
+        const title = "Selecting relevant memories";
+        const messages = withActiveContext(projected(ctx));
+        const systemPrompt = ctx.getSystemPrompt();
+        const modelContext: ModelContext = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel, getSystemPrompt: () => systemPrompt };
+        return {
+          kind: "inject", title,
+          run: async (_report, signal) => {
+            if (background) void log.write("operation.start", { title });
+            return selectInjection(ctx, await file.read(), messages, { modelContext, signal });
+          },
+          complete: (addition) => {
+            if (addition) pi.sendMessage(addition, { triggerTurn: false });
+            if (!hasPanel(ctx)) notify(ctx, addition ? "Injected relevant memories" : "No relevant memories selected");
+          },
+        };
+      });
     },
   });
   type Job = {
@@ -759,9 +769,9 @@ export default function smartMemory(pi: ExtensionAPI): void {
     } };
   }
 
-  registerMaintenanceCommand(commands.reclassify, "Review and update stored memory kinds", (args, ctx) =>
+  registerMaintenanceCommand(commands.reclassify, "Reclassify after Hermes import; searches indexed chats as needed (global includes global memories)", (args, ctx) =>
     batchJob(ctx, "reclassify", "Reclassifying memories", scopedMaintenance(project, args),
-      (changes) => `Reclassified ${changes} saved memories`, reclassifyMemories));
+      (changes) => `Reclassified ${changes} saved memories`, (options) => reclassifyMemories(options, sessionSearch)));
 
   registerMaintenanceCommand(commands.cleanupConflicts, "Clean up stored memory conflicts with guidance or other memories", (args, ctx) => {
     const mode = cleanupMode(args);

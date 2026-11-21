@@ -106,7 +106,7 @@ export async function runModel(ctx: ModelContext, messages: Message[], task: str
 }
 
 export function reviewTask(settings: Settings, trigger: Trigger, request?: string) {
-  return [prompt(settings, "precedence"), prompt(settings, "write"), prompt(settings, "review"), prompt(settings, trigger), request && JSON.stringify(request)].filter(Boolean).join("\n\n");
+  return [prompt(settings, "precedence"), prompt(settings, "write"), prompt(settings, "classification"), prompt(settings, "review"), prompt(settings, trigger), request && JSON.stringify(request)].filter(Boolean).join("\n\n");
 }
 
 export function injectionText(entries: readonly string[], cap = 32 * 1024) {

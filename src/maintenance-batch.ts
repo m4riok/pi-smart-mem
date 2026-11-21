@@ -17,15 +17,15 @@ export type BatchOptions = {
 
 type DecisionContext = Pick<BatchOptions, "ctx" | "settings" | "signal" | "diagnostics">;
 type Attempt = { scope: Scope; noteIds: string[]; attempt: 1 | 2 };
-export async function requestDecision({ ctx, settings, signal, diagnostics }: DecisionContext, fields: Attempt, task: string, input: unknown, tool: Operation) {
+export async function requestDecision({ ctx, settings, signal, diagnostics }: DecisionContext, fields: Attempt, task: string, input: unknown, decision: Operation, lookup?: Operation) {
   const model = { ...ctx, getSystemPrompt: () => "" };
-  const trace = traceDecision(settings.debugLogging ? diagnostics : undefined, "maintenance.decision", { ...fields, tool: tool.name }, input);
-  const report = await runModel(model, [{ role: "user", content: JSON.stringify(input), timestamp: 0 }], task, [tool], {
-    settings, signal, done: () => true, onResponse: trace?.onResponse,
+  const trace = traceDecision(settings.debugLogging ? diagnostics : undefined, "maintenance.decision", { ...fields, tool: decision.name }, input);
+  const report = await runModel(model, [{ role: "user", content: JSON.stringify(input), timestamp: 0 }], task, lookup ? [decision, lookup] : [decision], {
+    settings, signal, done: ({ name, isError }) => name === decision.name || isError, onResponse: trace?.onResponse,
   });
-  const call = report.calls[0];
-  if (!call) throw new Error(`Model did not call ${tool.name}`);
-  if (call.isError) throw new Error(String(call.result).split("\n\nReceived arguments:\n", 1)[0]);
+  const call = report.calls.at(-1);
+  if (call?.isError) throw new Error(String(call.result).split("\n\nReceived arguments:\n", 1)[0]);
+  if (call?.name !== decision.name) throw new Error(`Model did not call ${decision.name}`);
   trace?.result(call.result);
 }
 
@@ -70,17 +70,18 @@ export async function runBatches(options: BatchOptions, title: string, decide: (
   return result;
 }
 
-export async function reclassifyMemories(options: BatchOptions): Promise<MaintenanceResult> {
+export async function reclassifyMemories(options: BatchOptions, sessionSearch: Operation): Promise<MaintenanceResult> {
   const { store, settings } = options;
+  const task = [prompt(settings, "classification"), prompt(settings, "reclassify")].join("\n\n");
   return runBatches(options, "Reclassifying", async (fields, notes) => {
     let changes = 0;
-    const tool = operation(toolNames.reclassify, "Submit changed kinds using IDs from this batch. Submit an empty updates list if none.",
+    const tool = operation(toolNames.reclassify, "After any needed session searches, submit changed kinds using IDs from this batch. Submit an empty updates list if none.",
       Type.Object({ updates: Type.Array(Type.Object({ id, kind: memoryKind })) }), async ({ updates }, signal) => {
         const classified = resolveBatch(notes, updates).map(({ note, update }) => ({ note, kind: update.kind }));
         changes = await store.reclassify(classified, signal);
         return { value: { changes } };
       });
-    await requestDecision(options, fields, prompt(settings, "reclassify"), { notes }, tool);
+    await requestDecision(options, fields, task, { notes }, tool, sessionSearch);
     return changes;
   });
 }
