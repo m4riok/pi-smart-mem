@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { commands } from "./commands.ts";
 import type { Progress } from "./embeddings.ts";
 import type { HermesSource } from "./hermes-source.ts";
 import { MemoryStore, type Embedding, type ImportData } from "./memory-store.ts";
@@ -14,7 +15,7 @@ export async function migrateHermes(options: {
   const { source, dbPath, force, embed, progress } = options;
   const store = new MemoryStore(undefined, dbPath);
   if (!force && await store.hasStoredData()) {
-    throw new Error("Smart Mem already contains data. Run /migrate-hermes --force to replace it.");
+    throw new Error(`Smart Mem already contains data. Run /${commands.migrateHermes} --force to replace it.`);
   }
 
   const embedded = [];

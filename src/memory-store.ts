@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { RecordId, type Surreal } from "surrealdb";
 import { DEFAULT_DATABASE_PATH, withDatabase } from "./database.ts";
+import { commands } from "./commands.ts";
 
 const categories = {
   project: ["repository_information", "workflow_decision", "local_failure"],
@@ -8,6 +9,8 @@ const categories = {
 } as const;
 
 export type Scope = keyof typeof categories;
+export type Inventory = { memories: number; skills: number; pins: number };
+export type ScopedInventory = { project?: Inventory; global: Inventory };
 export type Category = (typeof categories)[Scope][number];
 export type EmbeddingSpace = { model: string; dimensions: number };
 export type Embedding = { model: string; values: readonly number[] };
@@ -63,7 +66,8 @@ function validateEmbedding(space: EmbeddingSpace, embedding: Embedding): void {
   }
 }
 
-const dataTables = ["memory_link", "memory", "smart_skill", "smart_pin", "smart_transcript"];
+const inventoryTables = ["memory", "smart_skill", "smart_pin"];
+const dataTables = ["memory_link", ...inventoryTables, "smart_transcript"];
 
 async function hasStoredData(db: Surreal): Promise<boolean> {
   const [found] = await db.query<[boolean]>(`RETURN ${dataTables.map((table) => `(SELECT VALUE id FROM ${table} LIMIT 1) != []`).join(" OR ")}`);
@@ -124,13 +128,28 @@ export class MemoryStore {
     return this.#use(async (db) => (await db.query<[EmbeddingSpace | undefined]>(selectSpace))[0]);
   }
 
+  async inventory(): Promise<ScopedInventory> {
+    type Counts = { project?: string; total: number }[];
+    return this.#use(async (db) => {
+      const [memories, skills, pins] = await db.query<[Counts, Counts, Counts]>(
+        inventoryTables.map((table) => `SELECT project, count() AS total FROM ${table} WHERE ${visible} GROUP BY project;`).join("\n"),
+        { project: this.#project },
+      );
+      const forProject = (project?: string): Inventory => {
+        const count = (rows: Counts) => rows.find((row) => row.project === project)?.total ?? 0;
+        return { memories: count(memories), skills: count(skills), pins: count(pins) };
+      };
+      return { project: this.#project === undefined ? undefined : forProject(this.#project), global: forProject() };
+    });
+  }
+
   async hasStoredData(): Promise<boolean> {
     return this.#use(hasStoredData);
   }
 
   async replaceImportedData(data: ImportData, force: boolean): Promise<void> {
     await this.#use(async (db) => {
-      if (!force && await hasStoredData(db)) throw new Error("Smart Mem already contains data. Run /migrate-hermes --force to replace it.");
+      if (!force && await hasStoredData(db)) throw new Error(`Smart Mem already contains data. Run /${commands.migrateHermes} --force to replace it.`);
       const [space] = await db.query<[EmbeddingSpace | undefined]>(selectSpace);
       if (!space) throw new Error("Smart Mem database is not initialized");
       const field = await activeField(db);
@@ -249,7 +268,7 @@ export class MemoryStore {
   }
 
   // Only link-building callers use this method; recall and CRUD never create edges.
-  async link(from: string, to: string): Promise<boolean> {
+  async link(from: string, to: string, signal?: AbortSignal): Promise<boolean> {
     if (from === to) return false;
     return this.#use(async (db) => {
       const source = await this.#read(db, from);
@@ -258,6 +277,7 @@ export class MemoryStore {
       const bindings = { from: record(from), to: record(to) };
       const [existing] = await db.query<[RecordId[]]>("SELECT VALUE id FROM memory_link WHERE in = $from AND out = $to LIMIT 1", bindings);
       if (existing.length > 0) return false;
+      signal?.throwIfAborted();
       await db.query("RELATE $from->memory_link->$to", bindings);
       return true;
     });
@@ -314,8 +334,11 @@ export class MemoryStore {
     return rows.map(memory);
   }
 
-  async markReviewed(note: Memory): Promise<void> {
-    await this.#use(async (db) => { await db.query(`UPDATE $id SET reviewed = true WHERE ${visible}`, this.#bind({ id: record(note.id) })); });
+  async markReviewed(note: Memory, signal?: AbortSignal): Promise<void> {
+    await this.#use(async (db) => {
+      signal?.throwIfAborted();
+      await db.query(`UPDATE $id SET reviewed = true WHERE ${visible}`, this.#bind({ id: record(note.id) }));
+    });
   }
 
   async candidates(note: Memory, limit: number, sameScope: boolean): Promise<Memory[]> {

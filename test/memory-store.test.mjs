@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { Archive } from "../src/archive.ts";
 import { withDatabase } from "../src/database.ts";
 import { MemoryStore } from "../src/memory-store.ts";
 
@@ -47,6 +48,25 @@ test("explicit initialization and durable scoped CRUD", async (t) => {
   });
   assert.equal(await store.remove(local.id), true);
   assert.equal(await store.read(local.id), undefined);
+});
+
+test("inventory counts memories, skills and pins without counting unrelated projects", async (t) => {
+  const { path, store, other, global } = await fixture(t);
+  const archive = new Archive(path, store.project);
+  const otherArchive = new Archive(path, other.project);
+  const skill = { name: "Fixture", description: "Test", text: "Run tests" };
+  await store.add(projectNote("Current project"), query);
+  await other.add(projectNote("Unrelated project"), query);
+  await global.add(preference("Global preference"), query);
+  await global.add({ scope: "global", category: "global_workflow_failure", text: "Global failure" }, query);
+  await archive.saveSkill({ ...skill, scope: "project" });
+  await archive.saveSkill({ ...skill, scope: "global" });
+  await otherArchive.saveSkill({ ...skill, scope: "project" });
+  await archive.pin("global", "Global pin");
+  await otherArchive.pin("project", "Unrelated pin");
+  const shared = { memories: 2, skills: 1, pins: 1 };
+  assert.deepEqual(await store.inventory(), { project: { memories: 1, skills: 1, pins: 0 }, global: shared });
+  assert.deepEqual(await global.inventory(), { project: undefined, global: shared });
 });
 
 test("search filters before ranking and returns project and global labels", async (t) => {

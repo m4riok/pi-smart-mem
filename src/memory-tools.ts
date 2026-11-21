@@ -16,39 +16,59 @@ export function operation<T extends TSchema>(name: string, description: string, 
   return { name, description, parameters, call: async (args, signal) => { signal?.throwIfAborted(); return call(args as Static<T>, signal); } };
 }
 
-export const lookupNames = ["memory_search", "memory_read", "memory_related", "memory_global_preferences"];
+const prefix = "psm_";
+export const toolNames = {
+  memorySearch: `${prefix}memory_search`,
+  memoryRead: `${prefix}memory_read`,
+  memoryAdd: `${prefix}memory_add`,
+  memoryReplace: `${prefix}memory_replace`,
+  memoryRemove: `${prefix}memory_remove`,
+  memoryRelated: `${prefix}memory_related`,
+  memoryGlobalPreferences: `${prefix}memory_global_preferences`,
+  skillSearch: `${prefix}skill_search`,
+  skillRead: `${prefix}skill_read`,
+  skillSave: `${prefix}skill_save`,
+  sessionSearch: `${prefix}session_search`,
+  selectMemories: `${prefix}select_memories`,
+  selectLinks: `${prefix}select_links`,
+  consolidateNote: `${prefix}consolidate_note`,
+};
+
+const oldToolNames = new Map(Object.values(toolNames).map((name) => [name.slice(prefix.length), name]));
+export const currentToolName = (name: string) => oldToolNames.get(name) ?? name;
+export const lookupNames = [toolNames.memorySearch, toolNames.memoryRead, toolNames.memoryRelated, toolNames.memoryGlobalPreferences];
 
 export function memoryTools(getStore: () => MemoryStore, getArchive: () => Archive, embed: (text: string, query: boolean, signal?: AbortSignal) => Promise<Embedding>, sessionFile: () => string | undefined): Operation[] {
   const output = async <T>(task: Promise<T>): Promise<Outcome> => ({ value: await task });
   return [
-    operation("memory_search", "Find saved memories by keyword and meaning.", Type.Object({ query: text, limit, scope: Type.Optional(scope), category: Type.Optional(Type.Union([projectCategories, globalCategories])) }), async (args, signal) => {
+    operation(toolNames.memorySearch, "Find saved memories by keyword and meaning.", Type.Object({ query: text, limit, scope: Type.Optional(scope), category: Type.Optional(Type.Union([projectCategories, globalCategories])) }), async (args, signal) => {
       const embedding = await embed(args.query, true, signal);
       const notes = await getStore().search({ ...args, text: args.query, embedding, limit: args.limit ?? 10 });
       return { value: notes.map(({ project: _, ...note }) => ({ ...note, scope: note.scope === "project" ? "Project" : "Global" })) };
     }),
-    operation("memory_read", "Read one saved memory by ID.", Type.Object({ id }), ({ id }) => output(getStore().read(id))),
-    operation("memory_add", "Save a new durable memory to the selected scope and category.", Type.Object({ scope, category: Type.Union([projectCategories, globalCategories]), text }), async (args, signal) => {
+    operation(toolNames.memoryRead, "Read one saved memory by ID.", Type.Object({ id }), ({ id }) => output(getStore().read(id))),
+    operation(toolNames.memoryAdd, "Save a new durable memory to the selected scope and category.", Type.Object({ scope, category: Type.Union([projectCategories, globalCategories]), text }), async (args, signal) => {
       // MemoryStore validates that the selected category belongs to the requested scope.
       const value = await getStore().add(args as Draft, await embed(args.text, false, signal), signal);
       return { value, saved: true };
     }),
-    operation("memory_replace", "Replace the text of a saved memory without changing its scope or links.", Type.Object({ id, text }), async (args, signal) => {
+    operation(toolNames.memoryReplace, "Replace the text of a saved memory without changing its scope or links.", Type.Object({ id, text }), async (args, signal) => {
       const value = await getStore().replace(args.id, args.text, await embed(args.text, false, signal), signal);
       return { value, saved: !!value };
     }),
-    operation("memory_remove", "Remove one saved memory by ID.", Type.Object({ id }), async ({ id }, signal) => {
+    operation(toolNames.memoryRemove, "Remove one saved memory by ID.", Type.Object({ id }), async ({ id }, signal) => {
       const removed = await getStore().remove(id, signal);
       return { value: { removed }, saved: removed };
     }),
-    operation("memory_related", "Find one hop of stored graph neighbors from a saved memory.", Type.Object({ id }), ({ id }) => output(getStore().related(id))),
-    operation("memory_global_preferences", "Find global user preferences semantically related to a project memory.", Type.Object({ id, limit }), ({ id, limit }) => output(getStore().relatedGlobalPreferences(id, limit ?? 5))),
-    operation("skill_search", "Find stored reusable procedures by name or description.", Type.Object({ query: Type.String(), scope: Type.Optional(scope) }), ({ query, scope }) => output(getArchive().searchSkills(query, scope))),
-    operation("skill_read", "Read a stored reusable procedure by ID.", Type.Object({ id }), ({ id }) => output(getArchive().readSkill(id))),
-    operation("skill_save", "Save a reusable procedure or revise a procedure in the same scope using its ID.", Type.Object({ id: Type.Optional(id), name: text, description: text, text, scope }), async ({ id, ...draft }, signal) => {
+    operation(toolNames.memoryRelated, "Find one hop of stored graph neighbors from a saved memory.", Type.Object({ id }), ({ id }) => output(getStore().related(id))),
+    operation(toolNames.memoryGlobalPreferences, "Find global user preferences semantically related to a project memory.", Type.Object({ id, limit }), ({ id, limit }) => output(getStore().relatedGlobalPreferences(id, limit ?? 5))),
+    operation(toolNames.skillSearch, "Find stored reusable procedures by name or description.", Type.Object({ query: Type.String(), scope: Type.Optional(scope) }), ({ query, scope }) => output(getArchive().searchSkills(query, scope))),
+    operation(toolNames.skillRead, "Read a stored reusable procedure by ID.", Type.Object({ id }), ({ id }) => output(getArchive().readSkill(id))),
+    operation(toolNames.skillSave, "Save a reusable procedure or revise a procedure in the same scope using its ID.", Type.Object({ id: Type.Optional(id), name: text, description: text, text, scope }), async ({ id, ...draft }, signal) => {
       const value = await getArchive().saveSkill(draft, id, signal);
       return { value, saved: !!value };
     }),
-    operation("session_search", "Search text in indexed past Pi conversations.", Type.Object({ query: text }), ({ query }) => output(getArchive().searchTranscripts(query, sessionFile()))),
+    operation(toolNames.sessionSearch, "Search text in indexed past Pi conversations.", Type.Object({ query: text }), ({ query }) => output(getArchive().searchTranscripts(query, sessionFile()))),
   ];
 }
 

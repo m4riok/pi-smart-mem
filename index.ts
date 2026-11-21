@@ -5,22 +5,26 @@ import type { Message } from "@earendil-works/pi-ai";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Archive, contentText } from "./src/archive.ts";
-import { LocalEmbeddings, models, type Device, type ModelPreset, type Progress } from "./src/embeddings.ts";
+import { embeddingDevice, models, type Device, type ModelPreset, type Progress } from "./src/embeddings.ts";
 import { migrateHermes } from "./src/hermes-migration.ts";
 import { readHermesSource } from "./src/hermes-source.ts";
-import { maintain } from "./src/maintenance.ts";
+import { maintain, type MaintenanceResult } from "./src/maintenance.ts";
+import { Diagnostics } from "./src/diagnostics.ts";
+import { commands } from "./src/commands.ts";
+import { MemoryPanel, memoryPanelShortcut, type Activity, type Level } from "./src/memory-panel.ts";
 import { MemoryStore, type Scope } from "./src/memory-store.ts";
-import { lookupNames, memoryTools, operation, registerTools } from "./src/memory-tools.ts";
+import { lookupNames, memoryTools, operation, registerTools, toolNames } from "./src/memory-tools.ts";
 import { resolveProject } from "./src/project.ts";
 import { detectTrigger, injectionText, newReport, reviewTask, reviewTitle, runModel, type RunReport, type Trigger, type UserTrigger } from "./src/review.ts";
-import { openSettings, prompt, SettingsFile, type Settings } from "./src/settings.ts";
+import { chooseEmbeddingModel, openSettings, prompt, SettingsFile, type Settings } from "./src/settings.ts";
+import { SharedEmbeddings } from "./src/shared-embeddings.ts";
 
 const injectedType = "smart-mem-injection";
 const initialType = "smart-mem-initial";
 const statusKey = "smart-mem";
+
 const isConversation = ({ role }: { role: string }) => role === "user" || role === "assistant";
 const isMissing = (error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; return false; };
-const reportError = (ctx: ExtensionContext, error: unknown) => ctx.ui.notify(`Smart Mem: ${String(error)}`, "error");
 
 function scopedMaintenance(project: string | undefined, args: string): Scope[] {
   const value = args.trim();
@@ -30,19 +34,18 @@ function scopedMaintenance(project: string | undefined, args: string): Scope[] {
   return ["project"];
 }
 
-async function progress<T>(ctx: ExtensionContext, title: string, action: (report: Progress) => Promise<T>): Promise<T> {
+async function fallbackProgress<T>(ctx: ExtensionContext, title: string, action: (report: Progress) => Promise<T>): Promise<T> {
   ctx.ui.setWidget(statusKey, [title]);
   try { return await action((message) => ctx.ui.setWidget(statusKey, [title, message])); }
   finally { ctx.ui.setWidget(statusKey, undefined); }
 }
 
 type ReviewRow = RunReport & { trigger: Trigger; status: string };
+const skipSummary = (count: number) => count ? ` · Skipped ${count} ${count === 1 ? "note" : "notes"}` : "";
 
 export default function smartMemory(pi: ExtensionAPI): void {
   const directory = join(getAgentDir(), "pi-smart-mem");
   const dbPath = join(directory, "db");
-  const file = new SettingsFile(directory);
-  const local = new LocalEmbeddings(directory);
   const main = process.env.PI_SUBAGENT_CHILD !== "1";
   let activePreset: ModelPreset | undefined;
   let project: string | undefined;
@@ -55,10 +58,70 @@ export default function smartMemory(pi: ExtensionAPI): void {
   let initial = false;
   let indexed = 0;
   let reviewQueue = Promise.resolve();
+  const panel = new MemoryPanel();
+  const toolActivity = new Map<string, Activity>();
+  let manualMaintenance: AbortController | undefined;
+  const hasPanel = (ctx: ExtensionContext) => main && ctx.mode === "tui";
+  const present = (ctx: ExtensionContext, message: string, level: Level, detail?: string) => {
+    if (hasPanel(ctx)) panel.notice(message.split("\n", 1)[0], level, detail ?? (message.includes("\n") ? message : undefined));
+    else ctx.ui.notify(message, level);
+  };
+  const log = new Diagnostics(directory, main ? "pi" : "subagent", (error) => {
+    if (activeContext) present(activeContext, `Cannot write Smart Mem diagnostics: ${String(error)}`, "warning");
+  });
+  const file = new SettingsFile(directory, log);
+  const embeddings = new SharedEmbeddings(directory, log);
+  const registerCommand: ExtensionAPI["registerCommand"] = (name, options) => pi.registerCommand(name, {
+    ...options, handler: async (args, ctx) => {
+      void log.write("command.start", { name });
+      await options.handler(args, ctx);
+    },
+  });
+  const begin = (ctx: ExtensionContext, title: string) => hasPanel(ctx) ? panel.begin(title) : undefined;
+  function notify(ctx: ExtensionContext, message: string, level: Level = "info", detail?: string) {
+    void log.write("notice", { message }, level);
+    present(ctx, message, level, detail);
+  }
+  const reportError = (ctx: ExtensionContext, error: unknown) => notify(ctx, `Smart Mem: ${String(error)}`, "error", String(error));
+  async function refreshCounts(ctx: ExtensionContext) {
+    if (!panel.mounted || !activePreset) return;
+    try { panel.setCounts(await store.inventory()); }
+    catch (error) { reportError(ctx, error); }
+  }
+  async function progress<T>(ctx: ExtensionContext, title: string, action: (report: Progress) => Promise<T>): Promise<T> {
+    void log.write("operation.start", { title });
+    const track = (report: Progress) => action((message) => {
+      void log.write("operation.progress", { title, message });
+      report(message);
+    });
+    const activity = begin(ctx, title);
+    if (!activity) return fallbackProgress(ctx, title, track);
+    try { return await track(activity.update); }
+    finally { activity.clear(); }
+  }
+  async function runMaintenance(options: Omit<Parameters<typeof maintain>[0], "onFailure" | "diagnostics">) {
+    const batch = { kind: options.kind, scopes: options.scopes.join(","), model: options.ctx.model?.id, automatic: !!options.automatic };
+    let started = false;
+    const start = () => { if (!started) { started = true; void log.write("maintenance.start", batch); } };
+    if (!options.automatic) start();
+    try {
+      const outcome = await maintain({ ...options, diagnostics: log, progress: (message) => {
+        start();
+        void log.write("maintenance.progress", { ...batch, message });
+        options.progress(message);
+      }, onFailure: (failure) => { void log.write("maintenance.note_failed", { ...batch, ...failure }, "warning"); } });
+      if (started) void log.write("maintenance.finish", { ...batch, ...outcome }, outcome.skipped ? "warning" : "info");
+      return outcome;
+    } catch (error) {
+      if (options.signal?.aborted) void log.write("maintenance.canceled", batch);
+      else void log.write("maintenance.failed", { ...batch, error: String(error) }, "error");
+      throw error;
+    }
+  }
   let lastContext: { projected: Message[]; actual: Message[] } | undefined;
 
   function getStore() {
-    if (!activePreset) throw new Error("Smart Mem is not set up. Open /smart-mem-settings in a main session");
+    if (!activePreset) throw new Error(`Smart Mem is not set up. Run /${commands.setup} in a main session`);
     return store;
   }
   function getArchive() { getStore(); return archive; }
@@ -67,15 +130,23 @@ export default function smartMemory(pi: ExtensionAPI): void {
     if (!match) throw new Error(`Unsupported Smart Mem embedding model: ${model}`);
     return match;
   }
+  async function readActivePreset() {
+    const space = await stat(dbPath).then((info) => info.isDirectory(), isMissing) ? await store.embeddingSpace() : undefined;
+    return space && preset(space.model);
+  }
+
   async function embed(text: string, query = false, signal?: AbortSignal) {
-    signal?.throwIfAborted();
-    const model = activePreset;
-    if (!model) throw new Error("Smart Mem is not set up");
-    const settings = await file.read();
-    return local.embed(model, settings.device, text, { query, signal });
+    if (!activePreset) throw new Error("Smart Mem is not set up");
+    return embeddings.run(async (worker) => {
+      const model = await readActivePreset();
+      if (!model) throw new Error("Smart Mem is not set up");
+      const settings = await file.read();
+      activePreset = model;
+      return worker.embed(model, embeddingDevice(model, settings.device), text, { query });
+    }, signal);
   }
   const tools = memoryTools(getStore, getArchive, embed, () => activeContext?.sessionManager.getSessionFile());
-  const reviewTools = tools.filter(({ name }) => name !== "skill_save");
+  const reviewTools = tools.filter(({ name }) => name !== toolNames.skillSave);
   registerTools(pi, main ? tools : reviewTools);
 
   async function bindProject(ctx: ExtensionContext) {
@@ -89,44 +160,46 @@ export default function smartMemory(pi: ExtensionAPI): void {
   }
 
   async function setup(ctx: ExtensionContext) {
-    const current = activePreset;
-    const options = models.map((m) => `${m.model} · ${m.size} · ${m.dimensions} dimensions${m.model === current?.model ? " (active)" : ""}`);
-    const selected = await ctx.ui.select(current ? "Smart Mem embedding model" : "Set up Smart Mem: select an embedding model", options);
-    if (!selected) return;
-    const next = models[options.indexOf(selected)];
+    const current = await readActivePreset();
+    const next = await chooseEmbeddingModel(ctx, current, await embeddings.run((worker) => worker.cudaUnavailable()));
+    if (!next) return;
     const rebuild = !!current && current.model !== next.model;
     const confirm = rebuild
       ? "Existing embeddings will be regenerated. Coordinate other Pi sessions before continuing. The old model stays active if the rebuild fails."
       : `Download ${next.model} (${next.size}) if needed and initialize local storage?`;
     if (!await ctx.ui.confirm(rebuild ? "Rebuild the memory index?" : current ? "Verify Smart Mem model?" : "Initialize Smart Mem?", confirm)) return;
-    const { device } = await file.read();
-    const space = { model: next.model, dimensions: next.dimensions };
-    await progress(ctx, rebuild ? "Rebuilding Smart Mem index" : "Setting up Smart Mem", async (report) => {
+    await progress(ctx, rebuild ? "Rebuilding Smart Mem index" : "Setting up Smart Mem", (report) => embeddings.run(async (worker) => {
+      if ((await readActivePreset())?.model !== current?.model) throw new Error("Smart Mem model changed in another session. Reopen setup and retry.");
+      const device = embeddingDevice(next, (await file.read()).device);
+      const space = { model: next.model, dimensions: next.dimensions };
       report("Loading embedding model");
-      await local.embed(next, device, next.model, { download: report });
+      await worker.embed(next, device, next.model, { download: report });
       if (rebuild) {
         let embedded = 0;
         await store.rebuild(space, async (text) => {
-          const embedding = await local.embed(next, device, text);
+          const embedding = await worker.embed(next, device, text);
           report(`Regenerated ${++embedded} embeddings`);
           return embedding;
         });
-      } else if (!current) {
-        await store.initialize(space);
-        await bindProject(ctx);
-      }
+      } else if (!current) await store.initialize(space);
+      if (!activePreset) await bindProject(ctx);
       activePreset = next;
-    });
-    ctx.ui.notify(`Smart Mem ready: ${next.model} on ${device.toUpperCase()}`, "info");
+      panel.setActive(true);
+      await refreshCounts(ctx);
+      notify(ctx, `Smart Mem ready: ${next.model} on ${device.toUpperCase()}`);
+    }));
   }
 
   async function setDevice(ctx: ExtensionContext, device: Device) {
-    if ((await file.read()).device === device) return;
-    const space = await getStore().embeddingSpace();
-    if (!space) throw new Error("Set up Smart Mem before changing device");
-    await progress(ctx, `Testing ${device.toUpperCase()}`, async () => {
-      await local.embed(preset(space.model), device, "Test embedding device");
-      await file.update({ device });
+    await embeddings.run(async (worker) => {
+      if ((await file.read()).device === device) return;
+      const model = await readActivePreset();
+      if (!model) throw new Error("Set up Smart Mem before changing device");
+      await progress(ctx, `Testing ${device.toUpperCase()}`, async () => {
+        await worker.embed(model, device, "Test embedding device");
+        await file.update({ device });
+        if (hasPanel(ctx)) panel.notice(`Embedding device set to ${device.toUpperCase()}`);
+      });
     });
   }
 
@@ -143,11 +216,17 @@ export default function smartMemory(pi: ExtensionAPI): void {
     return [...lastContext.actual, ...messages.slice(before.length)];
   }
 
-  async function inject(ctx: ExtensionContext, settings: Settings, messages: Message[]) {
+  async function inject(ctx: ExtensionContext, settings: Settings, messages: Message[], manual = false) {
+    const action = () => selectInjection(ctx, settings, messages);
+    if (!manual && !hasPanel(ctx)) return action();
+    return progress(ctx, "Selecting relevant memories", action);
+  }
+
+  async function selectInjection(ctx: ExtensionContext, settings: Settings, messages: Message[]) {
     const ids: string[] = [];
     let submitted = false;
     const available = tools.filter(({ name }) => lookupNames.includes(name));
-    const selection = operation("select_memories", "Submit existing memory IDs in selection order; an empty list is valid.", Type.Object({ ids: Type.Array(Type.String()) }), ({ ids: chosen }) => {
+    const selection = operation(toolNames.selectMemories, "Submit existing memory IDs in selection order; an empty list is valid.", Type.Object({ ids: Type.Array(Type.String()) }), ({ ids: chosen }) => {
       ids.push(...new Set(chosen)); submitted = true;
       return { value: { selected: ids.length } };
     });
@@ -156,13 +235,17 @@ export default function smartMemory(pi: ExtensionAPI): void {
     if (!submitted) throw new Error("Model did not submit a memory selection");
     const notes = await getStore().readMany(ids);
     const { kept, overflow } = injectionText(notes.map(({ text }) => text));
-    if (overflow) ctx.ui.notify("Memory injection exceeded 32 KiB. Remaining notes were not injected.", "warning");
+    if (overflow) notify(ctx, "Memory injection exceeded 32 KiB. Remaining notes were not injected.", "warning");
+    else if (hasPanel(ctx)) panel.notice(kept.length ? `Injected ${kept.length} saved ${kept.length === 1 ? "memory" : "memories"}` : "No relevant memories selected");
+    void log.write("injection.finish", { selected: kept.length, overflow });
     if (!kept.length) return undefined;
     return { customType: injectedType, content: `${prompt(settings, "injected")}\n\n${kept.join("\n\n")}`, display: false };
   }
 
   async function review(ctx: ExtensionContext, settings: Settings, trigger: Trigger, messages: Message[], request?: string, signal?: AbortSignal): Promise<ReviewRow> {
     const report = newReport();
+    const activity = begin(ctx, `Memory review · ${trigger}`);
+    void log.write("review.start", { trigger, model: settings.reviewModel?.id ?? ctx.model?.id });
     const previous = reviewQueue;
     const loop = previous.then(async () => {
       signal?.throwIfAborted();
@@ -186,7 +269,12 @@ export default function smartMemory(pi: ExtensionAPI): void {
     finally { unregister?.(); }
     const failed = report.error || report.calls.some(({ isError }) => isError);
     const status = report.saved ? `Saved · ${report.saved}${failed ? " (with errors)" : ""}` : failed ? "Failed" : "Skipped";
-    return { ...report, calls: [...report.calls], trigger, status };
+    const row = { ...report, calls: [...report.calls], trigger, status };
+    void log.write("review.finish", { trigger, status, saved: report.saved, calls: report.calls.length, error: report.error }, failed ? "error" : "info");
+    for (const call of report.calls) void log.write("review.tool", { trigger, name: call.name, error: call.isError ? String(call.result) : undefined }, call.isError ? "error" : "info");
+    if (report.saved) await refreshCounts(ctx);
+    if (activity) activity.finish(`Memory review · ${status}`, failed ? "error" : "info", reviewDetails(row));
+    return row;
   }
 
   async function flush(ctx: ExtensionContext, preCompact?: AbortSignal) {
@@ -209,18 +297,22 @@ export default function smartMemory(pi: ExtensionAPI): void {
     if (!header || entries.length <= indexed || !await stat(path).then(() => true, isMissing)) return;
     const end = entries.length;
     await archive.index(path, [header, ...entries.slice(indexed, end)]);
+    void log.write("transcript.index", { entries: end - indexed });
     indexed = end;
   }
 
   pi.on("session_start", async (_event, ctx) => {
     activeContext = ctx;
-    const space = await stat(dbPath).then((info) => info.isDirectory(), isMissing) ? await store.embeddingSpace() : undefined;
-    activePreset = space ? preset(space.model) : undefined;
-    if (activePreset) await bindProject(ctx);
-    initial = ctx.sessionManager.getEntries().some((entry) => entry.type === "custom" && entry.customType === initialType);
-    if (!activePreset && main && ctx.hasUI) {
-      try { await setup(ctx); } catch (error) { reportError(ctx, error); }
+    try { activePreset = await readActivePreset(); }
+    catch (error) { await log.write("session.start_failed", { error: String(error) }, "error"); throw error; }
+    if (hasPanel(ctx)) panel.mount(ctx.ui, !!activePreset);
+    if (activePreset) {
+      await bindProject(ctx);
+      await refreshCounts(ctx);
     }
+    void log.write("session.start", { mode: ctx.mode, configured: !!activePreset, model: activePreset?.model, project });
+    initial = ctx.sessionManager.getEntries().some((entry) => entry.type === "custom" && entry.customType === initialType);
+    if (!activePreset && main && ctx.hasUI) notify(ctx, `Smart Mem is not set up. Run /${commands.setup} to set it up.`, "warning");
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -231,7 +323,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
     const active = new Set(pi.getActiveTools());
     const memoryExposed = tools.some(({ name }) => active.has(name));
     const guidance = memoryExposed ? [prompt(settings, "precedence"), prompt(settings, "recall"), prompt(settings, "write")] : [];
-    if (main && active.has("skill_save")) guidance.push(prompt(settings, "skillWrite"));
+    if (main && active.has(toolNames.skillSave)) guidance.push(prompt(settings, "skillWrite"));
     if (pins.length) guidance.push(...pins);
     if (guidance.length) return { systemPrompt: [event.systemPrompt, ...guidance].join("\n\n") };
   });
@@ -241,24 +333,63 @@ export default function smartMemory(pi: ExtensionAPI): void {
   });
   pi.on("session_tree", () => { lastContext = undefined; pending = []; });
 
+  const reviewDetails = (data: ReviewRow) => [
+    `Trigger: ${data.trigger}`,
+    ...data.calls.map((call) => `${call.name} ${JSON.stringify(call.arguments)} → ${call.isError ? "Error: " : ""}${JSON.stringify(call.result) ?? "No result"}`),
+    data.rationale && `Reason: ${data.rationale}`, data.error && `Error: ${data.error}`,
+  ].filter(Boolean).join("\n");
+
   pi.registerEntryRenderer<ReviewRow>(reviewTitle, (entry, { expanded }, theme) => {
     const box = new Box(1, 0);
     const data = entry.data;
     if (!data) return box;
     box.addChild(new Text(theme.fg("accent", `Memory review · ${data.status}`), 0, 0));
     if (expanded) {
-      const details = [
-        `Trigger: ${data.trigger}`,
-        ...data.calls.map((call) => `${call.name} ${JSON.stringify(call.arguments)} → ${call.isError ? "Error: " : ""}${JSON.stringify(call.result) ?? "No result"}`),
-        data.rationale && `Reason: ${data.rationale}`, data.error && `Error: ${data.error}`,
-      ].filter(Boolean).join("\n");
       // Do not interpret model-provided terminal escapes in the custom renderer.
-      box.addChild(new Text(details.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ""), 0, 0));
+      box.addChild(new Text(reviewDetails(data).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ""), 0, 0));
     }
     return box;
   });
 
+  pi.on("session_shutdown", async (event, ctx) => {
+    manualMaintenance?.abort();
+    manualMaintenance = undefined;
+    panel.dispose();
+    toolActivity.clear();
+    try {
+      if (main && activePreset && event.reason !== "reload") {
+        await flush(ctx);
+        await indexCurrent(ctx);
+      }
+    } catch (error) { reportError(ctx, error); }
+    finally {
+      embeddings.close();
+      await log.write("session.shutdown", { reason: event.reason });
+    }
+  });
+
+  const exposedNames = new Set(tools.map(({ name }) => name));
+  pi.on("tool_execution_start", (event, ctx) => {
+    if (!exposedNames.has(event.toolName)) return;
+    void log.write("tool.start", { name: event.toolName, id: event.toolCallId });
+    if (hasPanel(ctx)) toolActivity.set(event.toolCallId, panel.begin(event.toolName));
+  });
+  const inventoryTools = new Set([toolNames.memoryAdd, toolNames.memoryRemove, toolNames.skillSave]);
+  pi.on("tool_execution_end", async (event, ctx) => {
+    if (!exposedNames.has(event.toolName)) return;
+    const saved = event.result?.details?.saved === true;
+    const status = event.isError ? "Failed" : saved ? "Saved" : "Finished";
+    const detail = contentText(event.result?.content) || undefined;
+    void log.write("tool.finish", { name: event.toolName, id: event.toolCallId, status, ms: event.durationMs,
+      error: event.isError ? detail : undefined }, event.isError ? "error" : "info");
+    toolActivity.get(event.toolCallId)?.finish(`${event.toolName} · ${status}`, event.isError ? "error" : "info", detail);
+    toolActivity.delete(event.toolCallId);
+    if (saved && inventoryTools.has(event.toolName)) await refreshCounts(ctx);
+  });
+
   if (!main) return;
+
+  pi.registerShortcut(memoryPanelShortcut, { description: "Toggle Memory panel details", handler: (ctx) => { if (hasPanel(ctx)) panel.toggle(); } });
 
   pi.on("message_end", async ({ message }, ctx) => {
     if (!activePreset || message.role !== "user") return;
@@ -318,44 +449,58 @@ export default function smartMemory(pi: ExtensionAPI): void {
     try {
       await indexCurrent(ctx);
       const settings = await file.read();
-      if (settings.autoLink) await maintain({ kind: "link", scopes: project ? ["project", "global"] : ["global"], automatic: true, ctx, store, settings,
-        messages: withActiveContext(projected(ctx)), embed: (text, signal) => embed(text, false, signal), progress: () => {} });
+      if (settings.autoLink) {
+        let activity: Activity | undefined;
+        try {
+          const result = await runMaintenance({ kind: "link", scopes: project ? ["project", "global"] : ["global"], automatic: true, ctx, store, settings,
+            messages: withActiveContext(projected(ctx)), embed: (text, signal) => embed(text, false, signal), progress: (line) => {
+              activity ??= begin(ctx, "Automatic linking");
+              activity?.update(line);
+            } });
+          activity?.finish(`Automatic linking · Created ${result.changes} memory links${skipSummary(result.skipped)}`);
+        } finally { activity?.clear(); }
+      }
     } catch (error) { reportError(ctx, error); }
   });
-  pi.on("session_shutdown", async (event, ctx) => {
-    if (!activePreset || event.reason === "reload") return;
-    try { await flush(ctx); await indexCurrent(ctx); } catch (error) { reportError(ctx, error); }
+  registerCommand(commands.setup, {
+    description: "Set up Smart Mem embeddings and storage",
+    handler: async (_args, ctx) => {
+      await ctx.waitForIdle();
+      try {
+        if (!ctx.hasUI) throw new Error("Smart Mem setup requires interactive Pi");
+        await setup(ctx);
+      } catch (error) { reportError(ctx, error); }
+    },
   });
-
-  pi.registerCommand("smart-mem-settings", {
+  registerCommand(commands.settings, {
     description: "Configure Smart Mem",
     handler: async (_args, ctx) => {
       await ctx.waitForIdle();
       try {
         await openSettings(ctx, file, reviewTools.map(({ name }) => name), {
-          modelName: () => activePreset?.model ?? "Not set up",
+          model: () => activePreset,
           setup: () => setup(ctx), device: (device) => setDevice(ctx, device),
           backfill: async () => {
             const a = getArchive();
             const count = await progress(ctx, "Backfilling past Pi conversations", (log) => a.backfill(join(getAgentDir(), "sessions"), log));
-            ctx.ui.notify(`Indexed ${count} Pi sessions`, "info");
+            notify(ctx, `Indexed ${count} Pi sessions`);
           },
           prune: async () => {
             if (!await ctx.ui.confirm("Clear transcript index?", "Original Pi transcripts will not be changed.")) return;
             await getArchive().prune();
-            ctx.ui.notify("Transcript index cleared", "info");
+            notify(ctx, "Transcript index cleared");
           },
         });
       } catch (error) { reportError(ctx, error); }
     },
   });
-  pi.registerCommand("migrate-hermes", {
+  registerCommand(commands.migrateHermes, {
     description: "Import all pi-hermes-memory data (use --force to replace existing Smart Mem data)",
     handler: async (args, ctx) => {
       await ctx.waitForIdle();
       try {
         const flag = args.trim();
-        if (flag && flag !== "--force") throw new Error("Use /migrate-hermes [--force]");
+        if (flag && flag !== "--force") throw new Error(`Use /${commands.migrateHermes} [--force]`);
         const force = flag === "--force";
         const source = await readHermesSource(getAgentDir(), ctx.cwd);
         if (!activePreset && ctx.hasUI) await setup(ctx);
@@ -365,51 +510,93 @@ export default function smartMemory(pi: ExtensionAPI): void {
           source, dbPath, force, embed: (text) => embed(text, false, ctx.signal), progress: log,
         }));
         await bindProject(ctx);
-        ctx.ui.notify(`Imported ${source.memories.length} memories, ${source.skills.length} skills, and ${source.pins.length} pins across global scope and ${result.projects} projects`, "info");
-        if (result.unmatchedProjects.length) {
-          ctx.ui.notify(`Imported projects without a matching folder:\n${result.unmatchedProjects.map(({ name, id }) => `${name}: ${id}`).join("\n")}`, "warning");
-        }
+        await refreshCounts(ctx);
+        const summary = `Imported ${source.memories.length} memories, ${source.skills.length} skills, and ${source.pins.length} pins across global scope and ${result.projects} projects`;
+        const unmatched = result.unmatchedProjects.length
+          ? `Imported projects without a matching folder:\n${result.unmatchedProjects.map(({ name, id }) => `${name}: ${id}`).join("\n")}` : undefined;
+        if (hasPanel(ctx) && unmatched) notify(ctx, `${summary} · ${result.unmatchedProjects.length} unmatched`, "warning", unmatched);
+        else notify(ctx, summary);
+        // The complete ID list must remain available even when panel details are truncated.
+        if (unmatched) ctx.ui.notify(unmatched, "warning");
       } catch (error) { reportError(ctx, error); }
     },
   });
-  pi.registerCommand("inject-mem", {
+  registerCommand(commands.inject, {
     description: "Select and inject relevant saved memories",
     handler: async (_args, ctx) => {
       await ctx.waitForIdle();
       try {
         getStore();
         const settings = await file.read();
-        const addition = await progress(ctx, "Selecting relevant memories", () => inject(ctx, settings, withActiveContext(projected(ctx))));
+        const addition = await inject(ctx, settings, withActiveContext(projected(ctx)), true);
         if (addition) pi.sendMessage(addition, { triggerTurn: false });
-        ctx.ui.notify(addition ? "Injected relevant memories" : "No relevant memories selected", "info");
+        if (!hasPanel(ctx)) notify(ctx, addition ? "Injected relevant memories" : "No relevant memories selected");
       } catch (error) { reportError(ctx, error); }
     },
   });
-  for (const [kind, command] of [["link", "link-mem"], ["consolidate", "consolidate-mem"]] as const) pi.registerCommand(command, {
+  for (const [kind, command] of [["link", commands.link], ["consolidate", commands.consolidate]] as const) registerCommand(command, {
     description: kind === "link" ? "Build related-memory links" : "Merge overlapping saved memories and shorten notes",
     handler: async (args, ctx) => {
-      await ctx.waitForIdle();
+      const background = ctx.mode === "tui";
+      if (!background) await ctx.waitForIdle();
+      if (manualMaintenance) {
+        notify(ctx, "Smart Mem maintenance is already running in this session", "warning");
+        return;
+      }
       try {
-        const settings = await file.read();
         const scopes = scopedMaintenance(project, args);
-        const changes = await progress(ctx, kind === "link" ? "Building memory links" : "Consolidating memories", (log) => maintain({
-          kind, scopes, ctx, store: getStore(), settings, messages: withActiveContext(projected(ctx)),
-          embed: (text, signal) => embed(text, false, signal), progress: log, signal: ctx.signal,
-        }));
-        ctx.ui.notify(kind === "link" ? `Created ${changes} memory links` : `Updated ${changes} saved memories`, "info");
+        const target = getStore();
+        const messages = kind === "link" ? withActiveContext(projected(ctx)) : [];
+        const systemPrompt = kind === "link" ? ctx.getSystemPrompt() : "";
+        const modelContext = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel,
+          getSystemPrompt: () => systemPrompt };
+        const title = kind === "link" ? "Building memory links" : "Consolidating memories";
+        const controller = new AbortController();
+        const foregroundSignal = background ? undefined : ctx.signal;
+        const signal = foregroundSignal ? AbortSignal.any([controller.signal, foregroundSignal]) : controller.signal;
+        const run = async (report: Progress) => runMaintenance({
+          kind, scopes, ctx: modelContext, store: target, settings: await file.read(), messages,
+          embed: (text, signal) => embed(text, false, signal), progress: report, signal,
+        });
+        const result = ({ changes, skipped }: MaintenanceResult) =>
+          (kind === "link" ? `Created ${changes} memory links` : `Updated ${changes} saved memories`) + skipSummary(skipped);
+        const activity = begin(ctx, title);
+        manualMaintenance = controller;
+        const finish = () => { if (manualMaintenance === controller) manualMaintenance = undefined; };
+        if (activity) {
+          // Keep the command handler out of Pi's input loop once work starts.
+          void (async () => {
+            try {
+              const outcome = await run(activity.update);
+              if (!signal.aborted && kind === "consolidate" && outcome.changes) await refreshCounts(ctx);
+              if (!signal.aborted) activity.finish(result(outcome), "info", `Scope: ${scopes.join(" and ")}${outcome.skipped ? "\nSee smart-mem.log for skipped notes." : ""}`);
+            } catch (error) {
+              if (!signal.aborted) {
+                void log.write("maintenance.command_error", { kind, error: String(error) }, "error");
+                activity.finish(`${title} · Failed`, "error", String(error));
+              }
+            } finally { activity.clear(); finish(); }
+          })().catch((error) => { if (!signal.aborted) reportError(ctx, error); });
+        } else {
+          try {
+            const changes = await progress(ctx, title, run);
+            if (!signal.aborted) notify(ctx, result(changes));
+          } finally { finish(); }
+        }
       } catch (error) { reportError(ctx, error); }
     },
   });
-  pi.registerCommand("memory-pin", {
+  registerCommand(commands.pin, {
     description: "Save standing instructions for this project or globally",
     handler: async (args, ctx) => {
       try {
         const value = args.trim();
         const scope = /^global(?:\s|$)/.test(value) ? "global" : "project";
         const text = scope === "global" ? value.slice(6).trim() : value;
-        if (!text) throw new Error("Use /memory-pin <text> or /memory-pin global <text>");
+        if (!text) throw new Error(`Use /${commands.pin} <text> or /${commands.pin} global <text>`);
         await getArchive().pin(scope, text);
-        ctx.ui.notify(`Saved ${scope} pin`, "info");
+        await refreshCounts(ctx);
+        notify(ctx, `Saved ${scope} pin`, "info", text);
       } catch (error) { reportError(ctx, error); }
     },
   });

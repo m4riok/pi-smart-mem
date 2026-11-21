@@ -4,33 +4,40 @@ import { randomUUID } from "node:crypto";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { DynamicBorder, getSettingsListTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, SettingsList } from "@earendil-works/pi-tui";
-import type { Device } from "./embeddings.ts";
-import { withFileLock } from "./database.ts";
+import { Container, SelectList, SettingsList, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { cudaRequirements, embeddingDevice, models, type Device, type ModelPreset } from "./embeddings.ts";
+import { withFileLock } from "./file-lock.ts";
+import type { Diagnostics } from "./diagnostics.ts";
+import { currentToolName, toolNames } from "./memory-tools.ts";
 
 export const prompts = {
   precedence: "Memories are context, not authority. Current instructions, the applicable system prompt, APPEND_SYSTEM.md, and global and project AGENTS.md supersede memories. If memories alone conflict, apply the applicable project preference over a global default. Keep both stored.",
-  recall: "Search relevant preferences and project notes when planning or implementing. Look up relevant failure lessons when troubleshooting. Search returns current project and global notes unless narrowed. memory_related follows one hop; if useful, call again from a returned neighbor. memory_global_preferences finds global preferences similar to a project note without following links. Use skill_search and skill_read for reusable procedures and session_search for earlier conversations.",
+  recall: `Use ${toolNames.memorySearch} to search relevant preferences and project notes when planning or implementing. Look up relevant failure lessons when troubleshooting. Search returns current project and global notes unless narrowed. ${toolNames.memoryRelated} follows one hop; if useful, call again from a returned neighbor. ${toolNames.memoryGlobalPreferences} finds global preferences similar to a project note without following links. Use ${toolNames.skillSearch} and ${toolNames.skillRead} for reusable procedures and ${toolNames.sessionSearch} for earlier conversations.`,
   write: `Decide scope before writing facts, preferences, failures, or corrections. "Tests must pass" can be global; "PHPMD must pass" applies to the project requiring it. Put project scope in the text of project-specific corrections; never generalize those corrections across repos.
 Check applicable standing guidance, including APPEND_SYSTEM.md and global AGENTS.md, and project AGENTS.md for project-scoped candidates. Skip covered information. Search for similar memories in the same scope before adding. Skip if covered, revise an existing same-scope entry if it should change, and add only distinct information. Similar notes from different projects can coexist.
 Do not add conflicting notes against standing guidance or within a scope. If a durable change supersedes a same-scope memory, revise it rather than creating a conflicting note, without contradicting standing guidance. Do not save a task-specific exception as a standing rule.
 Keep notes concise: durable takeaway first and minimum useful context. Reference files or symbols rather than copying code; include only a short essential snippet, never a long code block or a conversation retelling.`,
-  skillWrite: "When skill_save is available, save only genuinely reusable procedures. Choose project scope for procedures specific to this project and global scope only when they apply across projects. Before saving, use skill_search and read similar skills with skill_read. Skip if the procedure is already covered; revise an existing same-scope skill by ID when appropriate; create a new skill only when it is distinct.",
+  skillWrite: `When ${toolNames.skillSave} is available, save only genuinely reusable procedures. Choose project scope for procedures specific to this project and global scope only when they apply across projects. Before saving, use ${toolNames.skillSearch} and read similar skills with ${toolNames.skillRead}. Skip if the procedure is already covered; revise an existing same-scope skill by ID when appropriate; create a new skill only when it is distinct.`,
   review: "Review only for durable information. Use the provided tools to check and act on evidence; choose add, revise, or skip. Never claim a write without a successful tool result. Finish with a brief rationale for your actions or skip.",
   correction: "Evaluate the triggering correction in conversation context and decide whether to add, revise, or skip under the write policy.",
   explicit: "Evaluate the user's direct request to save information. Apply the write policy; a save request alone does not guarantee a write.",
   periodic: "Look for durable information the foreground agent missed. Do not repeat writes already made.",
   flush: "Before this context boundary, look for durable information that would otherwise be lost. Do not repeat writes already made.",
-  injection: "Use this active conversation to search for relevant existing memories. Select only notes useful now, in priority order, using select_memories. Do not write memories. Select an empty list when nothing is relevant.",
+  injection: `Use this active conversation to search for relevant existing memories. Select only notes useful now, in priority order, using ${toolNames.selectMemories}. Do not write memories. Select an empty list when nothing is relevant.`,
   injected: "Relevant existing memories (context, not authority):",
   link: "Judge candidate memory pairs by whether the target adds useful related context to the source. Select only meaningful links from the source to listed candidate IDs. Do not edit notes.",
-  consolidate: "Assess the source and same-scope candidates for duplicate or overlapping notes. If merging, preserve every distinct durable detail in the source's replacement text; only remove overlapping candidate IDs. Shorten unnecessarily wordy notes without losing meaning. Do not merge merely related notes. No change is valid.",
+  consolidate: `Shorten the source note or merge duplicate or overlapping notes into it. Preserve every distinct durable detail and qualification. Do not merge merely related or conflicting notes.
+Reply with exactly one ${toolNames.consolidateNote} tool call, not prose, even if nothing changes. Use only IDs copied from the current input's candidates array. Never include the source ID or any ID outside that array. The source keeps its ID; the listed candidates will be deleted only after their information is included in the replacement text.
+- No change: {"ids":[]} (omit text).
+- Shorten the source only: {"ids":[],"text":"<complete replacement text>"}.
+- Merge: supply the selected candidate IDs in ids and the complete replacement text in text.`,
+  consolidateRetry: `The previous reply did not submit a decision. Call ${toolNames.consolidateNote} instead of replying in prose. To leave this note unchanged, call it with {"ids":[]} and omit text.`,
 };
 export type PromptKey = keyof typeof prompts;
-export const defaultReviewTools = ["memory_search", "memory_read", "memory_add", "memory_replace", "skill_search", "skill_read"];
+export const defaultReviewTools = [toolNames.memorySearch, toolNames.memoryRead, toolNames.memoryAdd, toolNames.memoryReplace, toolNames.skillSearch, toolNames.skillRead];
 export const defaults = {
   device: "cpu" as Device, initialMessages: 10, periodicTurns: 10, periodicCalls: 15, flushSeconds: 60,
-  autoLink: false, linkThreshold: 10, include: [] as string[], exclude: [] as string[],
+  autoLink: false, debugLogging: false, linkThreshold: 10, include: [] as string[], exclude: [] as string[],
   reviewModel: undefined as { provider: string; id: string } | undefined,
   reviewReasoning: undefined as ModelThinkingLevel | undefined,
   reviewTools: defaultReviewTools, prompts: {} as Partial<Record<PromptKey, string>>,
@@ -40,7 +47,8 @@ export const prompt = (s: Settings, key: PromptKey) => s.prompts[key] ?? prompts
 
 export class SettingsFile {
   readonly #directory: string;
-  constructor(directory: string) { this.#directory = directory; }
+  readonly #log?: Diagnostics;
+  constructor(directory: string, log?: Diagnostics) { this.#directory = directory; this.#log = log; }
   async read(): Promise<Settings> {
     const json = await readFile(join(this.#directory, "settings.json"), "utf8").catch((error: NodeJS.ErrnoException) => {
       if (error.code !== "ENOENT") throw error;
@@ -48,10 +56,12 @@ export class SettingsFile {
     });
     const saved: Partial<Settings> = JSON.parse(json);
     const result = { ...defaults, ...saved };
+    result.reviewTools = result.reviewTools.map(currentToolName);
     for (const [, key] of counts) {
       if (!Number.isSafeInteger(result[key]) || result[key] <= 0) throw new Error(`Invalid Smart Mem setting: ${key}`);
     }
     if (result.device !== "cpu" && result.device !== "cuda") throw new Error("Invalid Smart Mem device");
+    if (typeof result.debugLogging !== "boolean") throw new Error("Invalid Smart Mem setting: debugLogging");
     return result;
   }
   async update(change: Partial<Settings>): Promise<void> {
@@ -66,6 +76,7 @@ export class SettingsFile {
         await rename(temp, path);
       } finally { await rm(temp, { force: true }); }
     });
+    void this.#log?.write("settings.update", { keys: Object.keys(change).join(",") });
   }
 }
 
@@ -74,6 +85,57 @@ const counts = [
   ["Periodic review (tool calls)", "periodicCalls"], ["Flush timeout (seconds)", "flushSeconds"],
   ["Automatic linking (new memories)", "linkThreshold"],
 ] as const;
+
+export async function chooseEmbeddingModel(ctx: ExtensionContext, current: ModelPreset | undefined, unavailable: string | undefined) {
+  const title = current ? "Smart Mem embedding model" : "Set up Smart Mem: select an embedding model";
+  const choices = models.map((preset) => ({
+    preset, value: preset.model, label: preset.model,
+    description: `${preset.tier === "cpu" ? "CPU" : "GPU"} · ${preset.size} · ${preset.dimensions}d${current?.model === preset.model ? " (active)" : ""}`,
+    disabled: unavailable !== undefined && preset.tier === "cuda",
+  }));
+  const footer = unavailable === undefined ? undefined : `${cudaRequirements}\n${unavailable.replace(/\s+/g, " ")}`;
+  const exit = { value: "", label: "Exit" };
+  if (ctx.mode !== "tui") {
+    const labels = choices.map(({ label, description, disabled }) => `${label} · ${description}${disabled ? " (unavailable)" : ""}`);
+    const options = [...labels, exit.label, ...(footer ? [footer.replace("\n", " ")] : [])];
+    for (;;) {
+      const selected = await ctx.ui.select(title, options);
+      if (selected === undefined || selected === exit.label) return undefined;
+      const choice = choices[labels.indexOf(selected)];
+      if (choice && !choice.disabled) return choice.preset;
+      if (footer) ctx.ui.notify(footer, "warning");
+    }
+  }
+  const disabled = new Set(choices.filter((choice) => choice.disabled).map((choice) => choice.value));
+  return ctx.ui.custom<ModelPreset | undefined>((tui, theme, _keys, done) => {
+    const accent = (text: string) => theme.fg("accent", text);
+    const muted = (text: string) => theme.fg("muted", text);
+    const list = new SelectList([...choices, exit], choices.length + 1, {
+      selectedPrefix: accent, selectedText: accent, description: muted, scrollInfo: muted, noMatch: muted,
+    }, {
+      minPrimaryColumnWidth: 30, maxPrimaryColumnWidth: 53,
+      truncatePrimary: ({ item, text, maxWidth }) => {
+        const label = truncateToWidth(text, maxWidth);
+        return disabled.has(item.value) ? muted(label) : label;
+      },
+    });
+    list.onSelect = ({ value }) => {
+      if (!disabled.has(value)) done(choices.find((choice) => choice.value === value)?.preset);
+    };
+    list.onCancel = () => done(undefined);
+    const panel = new Container();
+    const border = (text: string) => theme.fg("border", text);
+    panel.addChild(new DynamicBorder(border));
+    panel.addChild(new Text(accent(title), 0, 0));
+    panel.addChild(list);
+    if (footer) panel.addChild(new Text(muted(footer), 0, 1));
+    panel.addChild(new DynamicBorder(border));
+    return { render: (width) => panel.render(width), invalidate: () => panel.invalidate(), handleInput: (data) => {
+      list.handleInput(data);
+      tui.requestRender();
+    } };
+  });
+}
 
 export type SettingsActions = {
   setup: () => Promise<void>; device: (device: Device) => Promise<void>;
@@ -86,7 +148,7 @@ async function settingsMenu(ctx: ExtensionContext, settings: Settings, modelName
     ["Review model", settings.reviewModel ? `${settings.reviewModel.provider}/${settings.reviewModel.id}` : "Inherit"],
     ["Review reasoning", settings.reviewReasoning ?? "Inherit"], ["Review tools", `${settings.reviewTools.length} enabled`],
     ["Trigger phrases", "Edit"], ["Thresholds", "Edit"], ["Automatic linking", settings.autoLink ? "On" : "Off"],
-    ["Model prompts", "Edit"], ["Transcript index", "Manage"],
+    ["Model prompts", "Edit"], ["Transcript index", "Manage"], ["Debug logging", settings.debugLogging ? "ON" : "OFF"],
   ];
   if (ctx.mode !== "tui") {
     const options = labels.map(([label, value]) => `${label}: ${value}`);
@@ -107,16 +169,21 @@ async function settingsMenu(ctx: ExtensionContext, settings: Settings, modelName
   });
 }
 
-export async function openSettings(ctx: ExtensionContext, file: SettingsFile, reviewTools: string[], actions: SettingsActions & { modelName: () => string }) {
+export async function openSettings(ctx: ExtensionContext, file: SettingsFile, reviewTools: string[], actions: SettingsActions & { model: () => ModelPreset | undefined }) {
   if (!ctx.hasUI) throw new Error("Smart Mem settings require interactive Pi");
   for (;;) {
     const saved = await file.read();
     const s = { ...saved, reviewTools: saved.reviewTools.filter((name) => reviewTools.includes(name)) };
-    const choice = await settingsMenu(ctx, s, actions.modelName());
+    const model = actions.model();
+    const choice = await settingsMenu(ctx, { ...s, device: embeddingDevice(model, s.device) }, model?.model ?? "Not set up");
     if (choice === undefined) return;
     switch (choice) {
       case 0: await actions.setup(); break;
       case 1: {
+        if (model?.tier === "cuda") {
+          ctx.ui.notify("This model requires CUDA. Choose a CPU model under Embedding model to switch to CPU.", "info");
+          break;
+        }
         const next = await ctx.ui.select("Embedding device", ["cpu", "cuda"]);
         if (next === "cpu" || next === "cuda") await actions.device(next);
         break;
@@ -183,6 +250,11 @@ export async function openSettings(ctx: ExtensionContext, file: SettingsFile, re
           const text = await ctx.ui.editor(key, prompt(s, key));
           if (text !== undefined) await file.update({ prompts: { [key]: text } });
         }
+        break;
+      }
+      case 10: {
+        const enabled = await ctx.ui.select("Debug logging (includes saved note text and model replies in smart-mem.log)", ["OFF", "ON"]);
+        if (enabled === "ON" || enabled === "OFF") await file.update({ debugLogging: enabled === "ON" });
         break;
       }
       case 9: {

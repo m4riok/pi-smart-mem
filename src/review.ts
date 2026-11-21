@@ -1,4 +1,4 @@
-import { clampThinkingLevel, validateToolCall, type Message, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, validateToolCall, type AssistantMessage, type Message, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { contentText } from "./archive.ts";
 import { resultText, type Operation } from "./memory-tools.ts";
@@ -57,8 +57,11 @@ export function runnerContext(messages: Message[], systemPrompt: string): Messag
   });
 }
 
-export async function runModel(ctx: ExtensionContext, messages: Message[], task: string, tools: Operation[], options: {
-  settings: Settings; reviewer?: boolean; reasoning?: ModelThinkingLevel; signal?: AbortSignal; report?: RunReport; done?: () => boolean;
+export type ModelContext = Pick<ExtensionContext, "model" | "modelRegistry" | "thinkingLevel" | "getSystemPrompt">;
+
+export async function runModel(ctx: ModelContext, messages: Message[], task: string, tools: Operation[], options: {
+  settings: Settings; reviewer?: boolean; reasoning?: ModelThinkingLevel; signal?: AbortSignal; report?: RunReport;
+  done?: (call: ToolLog) => boolean; onResponse?: (response: AssistantMessage) => void;
 }): Promise<RunReport> {
   const { settings, signal, report = newReport() } = options;
   const override = options.reviewer ? settings.reviewModel : undefined;
@@ -74,6 +77,7 @@ export async function runModel(ctx: ExtensionContext, messages: Message[], task:
   for (let iteration = 0; iteration < 16; iteration++) {
     signal?.throwIfAborted();
     const response = await ctx.modelRegistry.streamSimple(model, { messages: context }, { signal, reasoning: reasoning === "off" ? undefined : reasoning }).result();
+    options.onResponse?.(response);
     signal?.throwIfAborted();
     if (response.stopReason === "error" || response.stopReason === "aborted" || response.stopReason === "length") throw new Error(response.errorMessage ?? `Model stopped: ${response.stopReason}`);
     if (contentText(response.content)) report.rationale = contentText(response.content);
@@ -92,9 +96,10 @@ export async function runModel(ctx: ExtensionContext, messages: Message[], task:
         ({ value: result, saved } = await tool.call(args, signal));
         if (saved) report.saved++;
       } catch (error) { result = String(error); isError = true; }
-      report.calls.push({ name: call.name, arguments: call.arguments, result: saved === undefined ? result : { saved, result }, isError });
+      const entry = { name: call.name, arguments: call.arguments, result: saved === undefined ? result : { saved, result }, isError };
+      report.calls.push(entry);
       context.push({ role: "toolResult", toolCallId: call.id, toolName: call.name, content: [{ type: "text", text: resultText(result, saved) }], isError, timestamp: Date.now() });
-      if (options.done?.()) return report;
+      if (options.done?.(entry)) return report;
     }
   }
   throw new Error("Model tool loop did not finish after 16 calls to the provider");

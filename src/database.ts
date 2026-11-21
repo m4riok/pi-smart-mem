@@ -1,24 +1,11 @@
-import { spawn } from "node:child_process";
-import { mkdir, open, stat } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { NodeEngine } from "@surrealdb/node";
 import { Surreal, type ConnectionState } from "surrealdb";
+import { withFileLock } from "./file-lock.ts";
 
 export const DEFAULT_DATABASE_PATH = join(homedir(), ".pi", "agent", "pi-smart-mem", "db");
-
-function acquireLock(fd: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    // flock locks the open file description shared with the parent. The lock
-    // survives helper exit and releases when the parent closes its descriptor.
-    const child = spawn("flock", ["--exclusive", "3"], { stdio: ["ignore", "ignore", "inherit", fd] });
-    child.once("error", (cause) => reject(new Error("Could not start flock for Smart Mem", { cause })));
-    child.once("close", (code, signal) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Could not acquire Smart Mem database lock (flock: ${signal ?? code})`));
-    });
-  });
-}
 
 function embeddedClient(directory: string): Surreal {
   // The embedded native binding takes a literal path after surrealkv://. The
@@ -30,17 +17,6 @@ function embeddedClient(directory: string): Surreal {
       override open(state: ConnectionState): void { super.open({ ...state, url: endpoint }); }
     }(context),
   } });
-}
-
-export async function withFileLock<T>(path: string, action: () => Promise<T>): Promise<T> {
-  // Never unlink the lock file: existing waiters would still use its old inode.
-  const handle = await open(path, "a", 0o600);
-  try {
-    await acquireLock(handle.fd);
-    return await action();
-  } finally {
-    await handle.close();
-  }
 }
 
 export async function withDatabase<T>(
