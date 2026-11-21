@@ -13,11 +13,12 @@ import { reclassifyMemories, type BatchOptions } from "./src/maintenance-batch.t
 import { cleanupConflicts, cleanupMode, conflictGuidance } from "./src/conflict-cleanup.ts";
 import { Diagnostics } from "./src/diagnostics.ts";
 import { commands } from "./src/commands.ts";
+import { JobQueue } from "./src/job-queue.ts";
 import { MemoryPanel, memoryPanelShortcut, type Activity, type Level } from "./src/memory-panel.ts";
 import { MemoryStore, type Scope } from "./src/memory-store.ts";
 import { lookupNames, memoryTools, operation, registerTools, toolNames } from "./src/memory-tools.ts";
 import { resolveProject } from "./src/project.ts";
-import { detectTrigger, injectionText, newReport, reviewTask, reviewTitle, runModel, type RunReport, type Trigger, type UserTrigger } from "./src/review.ts";
+import { detectTrigger, injectionText, newReport, reviewTask, reviewTitle, runModel, type ModelContext, type RunReport, type Trigger, type UserTrigger } from "./src/review.ts";
 import { reviewEvidence } from "./src/review-evidence.ts";
 import { chooseEmbeddingModel, openSettings, prompt, SettingsFile, type Settings } from "./src/settings.ts";
 import { SharedEmbeddings } from "./src/shared-embeddings.ts";
@@ -70,10 +71,9 @@ export default function smartMemory(pi: ExtensionAPI): void {
   let calls = 0;
   let initial = false;
   let indexed = 0;
-  let reviewQueue = Promise.resolve();
   const panel = new MemoryPanel();
   const toolActivity = new Map<string, Activity>();
-  let manualMaintenance: AbortController | undefined;
+  let foregroundManual = false;
   let deferredImportIndex: { pending: boolean } | undefined;
   const hasPanel = (ctx: ExtensionContext) => main && ctx.mode === "tui";
   const present = (ctx: ExtensionContext, message: string, level: Level, detail?: string, timeoutMs?: number) => {
@@ -98,6 +98,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
     present(ctx, message, level, detail, timeoutMs);
   }
   const reportError = (ctx: ExtensionContext, error: unknown, timeoutMs?: number) => notify(ctx, `Smart Mem: ${String(error)}`, "error", String(error), timeoutMs);
+  const jobs = new JobQueue((titles) => panel.setQueued(titles), (error) => { if (activeContext) reportError(activeContext, error); });
   async function refreshCounts(ctx: ExtensionContext) {
     if (!panel.mounted || !activePreset) return;
     try { panel.setCounts(await store.inventory()); }
@@ -236,7 +237,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
 
   async function setup(ctx: ExtensionCommandContext) {
     const current = await openActivePreset(ctx);
-    return runManualJob(ctx, ctx.mode === "tui" && !current, async (signal) => {
+    return runManualJob(ctx, ctx.mode === "tui" && !current ? "background" : "foreground", async (signal) => {
       const setup = await prepareSetup(ctx, current, signal);
       return setup && { kind: "setup", ...setup };
     });
@@ -294,15 +295,36 @@ export default function smartMemory(pi: ExtensionAPI): void {
     return { customType: injectedType, content: `${prompt(settings, "injected")}\n\n${kept.join("\n\n")}`, display: false };
   }
 
-  async function review(ctx: ExtensionContext, settings: Settings, trigger: Trigger, messages: Message[], request?: string, signal?: AbortSignal): Promise<ReviewRow> {
+  function queueReview(ctx: ExtensionContext, settings: Settings, trigger: Trigger, messages: Message[], request?: string) {
+    const title = `Memory review · ${trigger}`;
+    const systemPrompt = ctx.getSystemPrompt();
+    const modelContext: ModelContext = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: pi.getThinkingLevel(), getSystemPrompt: () => systemPrompt };
+    const evidence = settings.reviewTools.includes(toolNames.reinforceMemory) ? reviewEvidence(ctx.sessionManager.getBranch(), messages) : undefined;
+    jobs.enqueue({ title, run: async (lifetime) => {
+      const activity = begin(ctx, title);
+      const timeout = new AbortController();
+      const timer = trigger === "flush" ? setTimeout(() => timeout.abort(new DOMException("Memory review timed out", "TimeoutError")), Math.min(settings.flushSeconds * 1000, 2_147_483_647)) : undefined;
+      const signal = timer ? AbortSignal.any([lifetime, timeout.signal]) : lifetime;
+      try {
+        const row = await review(modelContext, settings, trigger, messages, evidence, request, signal);
+        if (lifetime.aborted) return;
+        if (row.saved) await refreshCounts(ctx);
+        if (lifetime.aborted) return;
+        pi.appendEntry(reviewTitle, row);
+        activity?.finish(`Memory review · ${row.status}`, row.error || row.calls.some(({ isError }) => isError) ? "error" : "info", reviewDetails(row));
+      } finally {
+        clearTimeout(timer);
+        activity?.clear();
+      }
+    } });
+  }
+
+  async function review(ctx: ModelContext, settings: Settings, trigger: Trigger, messages: Message[], evidence: ReturnType<typeof reviewEvidence> | undefined, request: string | undefined, signal: AbortSignal): Promise<ReviewRow> {
     const report = newReport();
-    const activity = begin(ctx, `Memory review · ${trigger}`);
     void log.write("review.start", { trigger, model: settings.reviewModel?.id ?? ctx.model?.id });
-    const previous = reviewQueue;
-    const loop = previous.then(async () => {
-      signal?.throwIfAborted();
+    const loop = async () => {
+      signal.throwIfAborted();
       const available = reviewTools.filter(({ name }) => settings.reviewTools.includes(name));
-      const evidence = settings.reviewTools.includes(toolNames.reinforceMemory) ? reviewEvidence(ctx.sessionManager.getBranch(), messages) : undefined;
       if (evidence) {
         const target = getStore();
         available.push(operation(toolNames.reinforceMemory,
@@ -315,44 +337,25 @@ export default function smartMemory(pi: ExtensionAPI): void {
           }));
       }
       const task = reviewTask(settings, trigger, request);
-      await runModel(ctx, evidence?.messages ?? messages, evidence ? `${task}\n\n${prompt(settings, "reinforce")}` : task, available, {
-        settings, reviewer: true, signal, report, reasoning: pi.getThinkingLevel(),
-      });
+      await runModel(ctx, evidence?.messages ?? messages, evidence ? `${task}\n\n${prompt(settings, "reinforce")}` : task, available, { settings, reviewer: true, signal, report });
+    };
+    let onAbort!: () => void;
+    const abort = new Promise<never>((_, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
     });
-    let unregister: (() => void) | undefined;
-    const abort = signal && new Promise<never>((_, reject) => {
-      const handler = () => reject(signal.reason);
-      signal.addEventListener("abort", handler, { once: true });
-      unregister = () => signal.removeEventListener("abort", handler);
-      if (signal.aborted) handler();
-    });
-    const settled = abort ? Promise.race([loop, abort]) : loop;
-    // Cancellation retires this review even if the provider does not settle.
-    // Keep prior reviews ordered; the expired loop checks its signal before tools and writes.
-    reviewQueue = previous.then(() => settled).catch(() => undefined);
-    try { await settled; }
+    // Retire timed-out reviews even if the provider ignores cancellation. The
+    // model loop checks the aborted signal before executing any later tool call.
+    try { await Promise.race([loop(), abort]); }
     catch (error) { report.error = String(error); }
-    finally { unregister?.(); }
+    finally { signal.removeEventListener("abort", onAbort); }
     const failed = report.error || report.calls.some(({ isError }) => isError);
     const status = report.saved ? `Saved · ${report.saved}${failed ? " (with errors)" : ""}` : failed ? "Failed" : "Skipped";
     const row = { ...report, calls: [...report.calls], trigger, status };
     void log.write("review.finish", { trigger, status, saved: report.saved, calls: report.calls.length, error: report.error }, failed ? "error" : "info");
     for (const call of report.calls) void log.write("review.tool", { trigger, name: call.name, error: call.isError ? String(call.result) : undefined }, call.isError ? "error" : "info");
-    if (report.saved) await refreshCounts(ctx);
-    if (activity) activity.finish(`Memory review · ${status}`, failed ? "error" : "info", reviewDetails(row));
     return row;
-  }
-
-  async function flush(ctx: ExtensionContext, preCompact?: AbortSignal) {
-    const branch = ctx.sessionManager.getBranch();
-    if (branch.filter((entry) => entry.type === "message" && entry.message.role === "user").length < 6) return;
-    const settings = await file.read();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new DOMException("Memory review timed out", "TimeoutError")), Math.min(settings.flushSeconds * 1000, 2_147_483_647));
-    const signal = preCompact ? AbortSignal.any([preCompact, controller.signal]) : controller.signal;
-    try {
-      pi.appendEntry(reviewTitle, await review(ctx, settings, "flush", withActiveContext(projected(ctx)), undefined, signal));
-    } finally { clearTimeout(timer); }
   }
 
   async function indexCurrent(ctx: ExtensionContext) {
@@ -420,15 +423,11 @@ export default function smartMemory(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
-    manualMaintenance?.abort();
-    manualMaintenance = undefined;
+    jobs.stop();
     panel.dispose();
     toolActivity.clear();
     try {
-      if (main && activePreset && event.reason !== "reload") {
-        await flush(ctx);
-        await indexCurrent(ctx);
-      }
+      if (main && activePreset && event.reason !== "reload") await indexCurrent(ctx);
     } catch (error) { reportError(ctx, error); }
     finally {
       embeddings.close();
@@ -481,12 +480,12 @@ export default function smartMemory(pi: ExtensionAPI): void {
       if (event.message.role === "assistant") calls += event.message.content.filter((part) => part.type === "toolCall").length;
       for (const request of pending.splice(0)) {
         if (!chat.some((m) => m.role === "user" && m.timestamp === request.timestamp)) continue;
-        entries.push({ type: "custom" as const, customType: reviewTitle, data: await review(ctx, settings, request.kind, messages, request.text, ctx.signal) });
+        queueReview(ctx, settings, request.kind, messages, request.text);
       }
       const due = turns >= settings.periodicTurns || calls >= settings.periodicCalls;
       const enough = chat.filter(({ role }) => role === "user").length >= 3 && active.filter((m) => "content" in m && (contentText(m.content).trim() || (Array.isArray(m.content) && m.content.some(({ type }) => type === "image" || type === "toolCall")))).length >= 4;
       if (due && enough && !ctx.signal?.aborted) {
-        entries.push({ type: "custom" as const, customType: reviewTitle, data: await review(ctx, settings, "periodic", messages, undefined, ctx.signal) });
+        queueReview(ctx, settings, "periodic", messages);
         turns = 0;
         calls = 0;
       }
@@ -501,8 +500,10 @@ export default function smartMemory(pi: ExtensionAPI): void {
     return { entries };
   });
 
-  pi.on("session_before_compact", async (event, ctx) => {
-    if (activePreset) try { await flush(ctx, event.signal); } catch (error) { reportError(ctx, error); }
+  pi.on("session_before_compact", async (_event, ctx) => {
+    if (!activePreset || ctx.sessionManager.getBranch().filter((entry) => entry.type === "message" && entry.message.role === "user").length < 6) return;
+    try { queueReview(ctx, await file.read(), "flush", withActiveContext(projected(ctx))); }
+    catch (error) { reportError(ctx, error); }
   });
   pi.on("session_compact", async (_event, ctx) => {
     lastContext = undefined;
@@ -519,15 +520,21 @@ export default function smartMemory(pi: ExtensionAPI): void {
       else await indexCurrent(ctx);
       const settings = await file.read();
       if (settings.autoLink) {
-        let activity: Activity | undefined;
-        try {
-          const result = await runMaintenance({ kind: "link", scopes: project ? ["project", "global"] : ["global"], automatic: true, ctx, store, settings,
-            messages: withActiveContext(projected(ctx)), embed: (text, signal) => embed(text, false, signal), progress: (line) => {
-              activity ??= begin(ctx, "Automatic linking");
-              activity?.update(line);
-            } });
-          activity?.finish(`Automatic linking · Created ${result.changes} memory links${skipSummary(result.skipped)}`);
-        } finally { activity?.clear(); }
+        const title = "Automatic linking";
+        const messages = withActiveContext(projected(ctx));
+        const systemPrompt = ctx.getSystemPrompt();
+        const modelContext: ModelContext = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel, getSystemPrompt: () => systemPrompt };
+        jobs.enqueue({ title, run: async (signal) => {
+          let activity: Activity | undefined;
+          try {
+            const result = await runMaintenance({ kind: "link", scopes: project ? ["project", "global"] : ["global"], automatic: true, ctx: modelContext, store, settings,
+              messages, signal, embed: (text, signal) => embed(text, false, signal), progress: (line) => {
+                activity ??= begin(ctx, title);
+                activity?.update(line);
+              } });
+            if (!signal.aborted) activity?.finish(`${title} · Created ${result.changes} memory links${skipSummary(result.skipped)}`);
+          } finally { activity?.clear(); }
+        } });
       }
     } catch (error) { reportError(ctx, error); }
   });
@@ -571,7 +578,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
       if (argument && argument !== "force") { reportError(ctx, new Error(`Use /${commands.migrateHermes} [force]`), noticeMs); return; }
       const force = argument === "force";
       const background = ctx.mode === "tui" && !force;
-      await runManualJob(ctx, background, async (signal) => {
+      await runManualJob(ctx, background ? "background" : "foreground", async (signal) => {
         const readSource = () => readHermesSource(getAgentDir(), ctx.cwd);
         // Verify that there is something to import before asking to set up.
         const sourceForSetup = !activePreset ? await readSource() : undefined;
@@ -658,53 +665,51 @@ export default function smartMemory(pi: ExtensionAPI): void {
     run: (report: Progress, signal: AbortSignal) => Promise<T>;
     complete?: (outcome: T, signal: AbortSignal, activity?: Activity) => void | Promise<void>;
   };
-  async function runManualJob<T>(ctx: ExtensionCommandContext, background: boolean, prepare: (signal: AbortSignal) => ManualWork<T> | undefined | Promise<ManualWork<T> | undefined>, noticeMs?: number): Promise<boolean> {
+  async function runManualJob<T>(ctx: ExtensionCommandContext, mode: "background" | "foreground" | "queued-response", prepare: (signal: AbortSignal) => ManualWork<T> | undefined | Promise<ManualWork<T> | undefined>, noticeMs?: number): Promise<boolean> {
+    const background = mode === "background";
+    const foreground = mode === "foreground";
     if (!background) await ctx.waitForIdle();
-    if (manualMaintenance) {
+    if (foregroundManual || (foreground && jobs.busy)) {
       notify(ctx, "Smart Mem maintenance is already running in this session", "warning");
       return false;
     }
-    const controller = new AbortController();
-    const foregroundSignal = background ? undefined : ctx.signal;
-    const signal = foregroundSignal ? AbortSignal.any([controller.signal, foregroundSignal]) : controller.signal;
-    manualMaintenance = controller;
-    const finish = () => { if (manualMaintenance === controller) manualMaintenance = undefined; };
+    const signal = !background && ctx.signal ? AbortSignal.any([jobs.signal, ctx.signal]) : jobs.signal;
+    if (foreground) foregroundManual = true;
     try {
       const work = await prepare(signal);
-      if (!work) { finish(); return false; }
+      if (!work) return false;
       const { kind, title, run, complete } = work;
       signal.throwIfAborted();
-      const activity = background ? begin(ctx, title) : undefined;
-      if (!activity) {
+      const execute = async () => {
+        signal.throwIfAborted();
+        const activity = background ? begin(ctx, title) : undefined;
         try {
-          const outcome = await progress(ctx, title, (report) => run(report, signal));
-          if (!signal.aborted) await complete?.(outcome, signal);
-        } finally { finish(); }
-        return false;
-      }
-      // Keep the command handler out of Pi's input loop once work starts.
-      void (async () => {
-        try {
-          const outcome = await run(activity.update, signal);
+          const outcome = activity ? await run(activity.update, signal) : await progress(ctx, title, (report) => run(report, signal));
           if (!signal.aborted) await complete?.(outcome, signal, activity);
         } catch (error) {
+          if (!activity) throw error;
           if (!signal.aborted) {
             void log.write("maintenance.command_error", { kind, error: String(error) }, "error");
             activity.finish(`${title} · Failed`, "error", String(error), noticeMs);
           }
-        } finally { activity.clear(); finish(); }
-      })().catch((error) => { if (!signal.aborted) reportError(ctx, error, noticeMs); });
-      return true;
+        } finally { activity?.clear(); }
+      };
+      if (foreground) await execute();
+      else {
+        const completion = jobs.enqueue({ title, run: execute });
+        // Scripted callers still receive the command outcome on completion.
+        if (!background) await completion;
+      }
+      return background;
     } catch (error) {
-      finish();
       if (!signal.aborted) reportError(ctx, error, noticeMs);
       return false;
-    }
+    } finally { if (foreground) foregroundManual = false; }
   }
 
   function registerMaintenanceCommand(command: string, description: string, prepare: (args: string, ctx: ExtensionCommandContext) => Job) {
     registerCommand(command, { description, handler: async (args, ctx) => {
-      await runManualJob(ctx, ctx.mode === "tui", () => {
+      await runManualJob(ctx, ctx.mode === "tui" ? "background" : "queued-response", () => {
         const { kind, title, scopes, summary, run, refresh } = prepare(args, ctx);
         return { kind, title, run, complete: async (outcome, signal, activity) => {
           const result = summary(outcome.changes) + skipSummary(outcome.skipped);

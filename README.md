@@ -32,9 +32,11 @@ Automatic memory review runs in the main Pi session:
 
 | Trigger | Default behavior |
 | --- | --- |
-| **Explicit save request or recognized correction** | Review at the end of the turn. |
+| **Explicit save request or recognized correction** | Queue a review at the end of the turn. |
 | **Periodic review** | After 10 turns or 15 assistant tool calls, once there are at least 3 user messages and 4 usable context messages. |
-| **Before compaction or on session shutdown** | Review once the conversation has at least 6 user messages. Shutdown review is skipped on reload. The review timeout defaults to 60 seconds. |
+| **Before compaction** | Queue a review if the conversation has at least 6 user messages. Compaction does not wait. Once this review starts, it has 60 seconds by default. |
+
+Reviews, interactive maintenance, background setup and import, and automatic linking share one sequential background queue per session. The Memory panel shows running and queued work. Exit or reload cancels unfinished jobs without starting a final review. Changes already saved stay saved. Foreground memory tools still return their actual results.
 
 Expand a **Memory review** row to see what Pi saved, revised, or skipped and why.
 

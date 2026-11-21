@@ -24,6 +24,7 @@ export class MemoryPanel {
   #counts?: ScopedInventory;
   #expanded = false;
   #running = new Map<symbol, { title: string; detail?: string }>();
+  #queued: readonly string[] = [];
   #latest?: Notice;
   #noticeTimer?: ReturnType<typeof setTimeout>;
   #animation?: ReturnType<typeof setInterval>;
@@ -48,6 +49,11 @@ export class MemoryPanel {
 
   setActive(active: boolean) {
     this.#active = active;
+    this.#tui?.requestRender();
+  }
+
+  setQueued(titles: readonly string[]) {
+    this.#queued = titles;
     this.#tui?.requestRender();
   }
 
@@ -119,6 +125,7 @@ export class MemoryPanel {
     this.#tui = undefined;
     this.#expanded = false;
     this.#running.clear();
+    this.#queued = [];
     this.#stopAnimation();
     this.#clearNotice();
     this.#counts = undefined;
@@ -143,6 +150,8 @@ export class MemoryPanel {
       rows.push(theme.fg("muted", line(`  ↻ ${title}${detail ? ` · ${detail}` : ""}`)));
     }
     if (additional.length > 3) rows.push(theme.fg("muted", line(`  +${additional.length - 3} more running`)));
+    for (const title of this.#queued.slice(0, 3)) rows.push(theme.fg("muted", line(`  Queued: ${title}`)));
+    if (this.#queued.length > 3) rows.push(theme.fg("muted", line(`  +${this.#queued.length - 3} more queued`)));
     const latest = this.#latest;
     if (latest) {
       rows.push(theme.fg(latest.level === "info" ? "muted" : latest.level, line(`  ${latest.summary}`)));

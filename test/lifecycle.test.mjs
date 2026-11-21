@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { getCurrentSystemPrompt, getCurrentTools, fauxProvider, fauxAssistantMessage, fauxToolCall, contentText } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Archive } from "../src/archive.ts";
@@ -123,6 +124,15 @@ async function pausedEmbeddingWorker(directory) {
 const text = (messages) => messages.filter((m) => m.role === "user").map((m) => contentText(m.content)).join("\n");
 const rows = (sessionManager) => sessionManager.getEntries().filter((e) => e.type === "custom" && e.customType === "smart-mem-review").map((e) => e.data);
 const injections = (sessionManager) => sessionManager.getEntries().filter((e) => e.type === "custom_message" && e.customType === "smart-mem-injection");
+
+async function waitFor(check, description) {
+  const deadline = Date.now() + 4000;
+  while (!await check()) {
+    assert.ok(Date.now() < deadline, `Timed out waiting for ${description}`);
+    await delay(10);
+  }
+}
+const waitForReviews = (manager, count) => waitFor(() => rows(manager).length >= count, `${count} review rows`);
 
 test("unconfigured startup warns without opening the picker; setup command asks before creating storage", async (t) => {
   const { session, dialogs, directory, alerts, errors, faux } = await fixture(t, { setup: true });
@@ -332,25 +342,28 @@ test("Pi runs user-triggered and periodic reviews and adds independent, repeatab
       assert.ok(!names.includes("psm_skill_save"));
       return fauxAssistantMessage(fauxToolCall("psm_memory_remove", { id: removable.id }));
     },
+    (ctx) => {
+      seen.push("initial");
+      assert.match(getCurrentSystemPrompt(ctx.messages), /Injection task fixture/);
+      return fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [note.id] }));
+    },
     fauxAssistantMessage("Removed obsolete fixture memory"),
     (ctx) => {
       seen.push("periodic");
       assert.match(getCurrentSystemPrompt(ctx.messages), /Periodic task fixture/);
       return fauxAssistantMessage("Nothing else to save");
     },
-    (ctx) => {
-      seen.push("initial");
-      assert.match(getCurrentSystemPrompt(ctx.messages), /Injection task fixture/);
-      return fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [note.id] }));
-    },
   ]);
   await session.prompt("First historical detail");
   await session.prompt("No, use pnpm for this task.");
+  await waitForReviews(sessionManager, 1);
   const file = new SettingsFile(directory);
   // A pre-prefix review allowlist still permits removal, but never skill saves.
   await file.update({ reviewTools: [...(await file.read()).reviewTools, "skill_save", "memory_remove"] });
   await session.prompt("Remember this: use fixtures for regression checks.");
-  assert.deepEqual(seen, ["correction", "explicit", "periodic", "initial"]);
+  await waitForReviews(sessionManager, 3);
+  assert.deepEqual(seen.filter((stage) => stage !== "initial"), ["correction", "explicit", "periodic"]);
+  assert.equal(seen.filter((stage) => stage === "initial").length, 1);
   assert.deepEqual(rows(sessionManager).map(({ trigger, status }) => [trigger, status]), [["correction", "Skipped"], ["explicit", "Saved · 1"], ["periodic", "Skipped"]]);
   assert.equal(await store.read(removable.id), undefined);
   assert.equal(injections(sessionManager).length, 1);
@@ -433,13 +446,115 @@ test("interactive maintenance reports progress and results while normal chat rem
   assert.match(await judging.promise, /Leave the source unchanged by default/);
   assert.ok(frames.at(-1).some((line) => line.includes("Consolidating global memories: 1/1")));
   await session.prompt("/psm-link global");
-  assert.ok(frames.at(-1).some((line) => line.includes("maintenance is already running")));
+  assert.ok(frames.at(-1).some((line) => line.includes("Queued: Building memory links")));
   await session.prompt("Background work should not block this prompt");
   assert.equal(faux.state.callCount, 2);
   decision.resolve(fauxAssistantMessage(fauxToolCall("psm_consolidate_note", { ids: [] })));
   await finished.promise;
+  await waitFor(() => frames.at(-1).some((line) => line.includes("Created 0 memory links")), "queued linking outcome");
   assert.equal(registrations, 1);
   assert.ok(frames.at(-1)[0].startsWith("🧠 ━━━━  Active"));
+  assert.deepEqual(errors, []);
+});
+
+test("reviews and consolidation share a FIFO queue without blocking chat or direct memory reads", { timeout: 10000 }, async (t) => {
+  let widget;
+  const { session, note, faux, directory, sessionManager, errors } = await fixture(t, {
+    mode: "tui",
+    setWidget: (_key, build) => { widget = build?.({ requestRender() {} }, { fg: (_color, text) => text }); },
+  });
+  await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
+  const first = Promise.withResolvers();
+  const consolidation = Promise.withResolvers();
+  const started = [];
+  t.after(() => { first.resolve(fauxAssistantMessage("First review done")); consolidation.resolve(fauxAssistantMessage(fauxToolCall("psm_consolidate_note", { ids: [] }))); });
+  faux.setResponses([
+    fauxAssistantMessage("Correction acknowledged"),
+    ({ messages }) => { started.push(["correction", text(messages)]); return first.promise; },
+    fauxAssistantMessage(fauxToolCall("psm_memory_read", { id: note.id })),
+    ({ messages }) => {
+      assert.match(contentText(messages.find(({ role }) => role === "toolResult").content), /Use exit status/);
+      return fauxAssistantMessage("Answer despite running review");
+    },
+    ({ messages }) => { started.push(["consolidation", text(messages)]); return consolidation.promise; },
+    ({ messages }) => { started.push(["explicit", text(messages)]); return fauxAssistantMessage("Second review done"); },
+  ]);
+  const render = () => widget.render(140).join("\n");
+  await session.prompt("No, use the actual exit status.");
+  assert.match(render(), /Memory review · correction/);
+  await session.prompt("/psm-consolidate global");
+  await session.prompt("Remember this: read the exit status from the wrapper.");
+  assert.deepEqual(started.map(([kind]) => kind), ["correction"]);
+  assert.match(render(), /Queued: Consolidating memories\n  Queued: Memory review · explicit/);
+  assert.deepEqual(rows(sessionManager), []);
+  first.resolve(fauxAssistantMessage("First review done"));
+  await waitFor(() => started.length >= 2, "consolidation after review");
+  assert.deepEqual(started.map(([kind]) => kind), ["correction", "consolidation"]);
+  assert.match(render(), /Consolidating global memories: 1\/1/);
+  assert.match(render(), /Queued: Memory review · explicit/);
+  consolidation.resolve(fauxAssistantMessage(fauxToolCall("psm_consolidate_note", { ids: [] })));
+  await waitForReviews(sessionManager, 2);
+  assert.deepEqual(started.map(([kind]) => kind), ["correction", "consolidation", "explicit"]);
+  assert.doesNotMatch(started[0][1], /read the exit status from the wrapper/);
+  assert.match(started[2][1], /read the exit status from the wrapper/);
+  assert.deepEqual(rows(sessionManager).map(({ trigger, rationale }) => [trigger, rationale]), [["correction", "First review done"], ["explicit", "Second review done"]]);
+  assert.doesNotMatch(render(), /Queued:/);
+  assert.deepEqual(errors, []);
+});
+
+test("RPC maintenance waits in the same queue and still reports its outcome", { timeout: 10000 }, async (t) => {
+  const { session, faux, directory, alerts, sessionManager } = await fixture(t);
+  await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
+  const review = Promise.withResolvers();
+  t.after(() => review.resolve(fauxAssistantMessage("Review done")));
+  faux.setResponses([
+    fauxAssistantMessage("Acknowledged"),
+    () => review.promise,
+    fauxAssistantMessage(fauxToolCall("psm_consolidate_note", { ids: [] })),
+  ]);
+  await session.prompt("No, use the actual exit status.");
+  let completed = false;
+  const command = session.prompt("/psm-consolidate global").then(() => { completed = true; });
+  const logPath = join(directory, "smart-mem.log");
+  await waitFor(async () => (await readFile(logPath, "utf8")).includes('"name":"psm-consolidate"'), "RPC command start");
+  assert.equal(completed, false);
+  assert.equal(faux.state.callCount, 2);
+  review.resolve(fauxAssistantMessage("Review done"));
+  await command;
+  assert.equal(rows(sessionManager).length, 1);
+  assert.deepEqual(alerts.at(-1), ["Updated 0 saved memories", "info"]);
+});
+
+for (const reason of ["quit", "reload"]) test(`${reason} cancels review and discards pending jobs without a final review`, { timeout: 10000 }, async (t) => {
+  const { session, note, store, faux, directory, sessionManager, errors } = await fixture(t, { mode: "tui" });
+  const settings = new SettingsFile(directory);
+  await settings.update({ initialMessages: 100, periodicTurns: 100, reviewTools: [...(await settings.read()).reviewTools, "psm_memory_remove"] });
+  faux.setResponses(Array.from({ length: 5 }, () => fauxAssistantMessage("Ordinary answer")));
+  for (let i = 0; i < 5; i++) await session.prompt(`Conversation message ${i}`);
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const returned = Promise.withResolvers();
+  t.after(() => release.resolve());
+  faux.appendResponses([
+    fauxAssistantMessage("Correction acknowledged"),
+    async (_ctx, options) => {
+      started.resolve(options.signal);
+      await release.promise;
+      returned.resolve();
+      return fauxAssistantMessage(fauxToolCall("psm_memory_remove", { id: note.id }));
+    },
+  ]);
+  await session.prompt("No, use the fixture instead.");
+  const signal = await started.promise;
+  await session.prompt("/psm-consolidate global");
+  if (reason === "reload") await session.reload();
+  else await session.extensionRunner.emit({ type: "session_shutdown", reason });
+  assert.equal(signal.aborted, true);
+  release.resolve();
+  await returned.promise;
+  assert.deepEqual(await store.read(note.id), note);
+  assert.deepEqual(rows(sessionManager), []);
+  assert.equal(faux.state.callCount, 7);
   assert.deepEqual(errors, []);
 });
 
@@ -482,6 +597,7 @@ test("interactive Memory panel reports foreground tools and reviews without repl
   ]);
   await session.prompt("Look up the test note");
   await session.prompt("No, use pnpm for this task.");
+  await waitForReviews(sessionManager, 1);
   assert.ok(panel.render(100).some((line) => line.includes("Memory review · Skipped")));
   assert.equal(rows(sessionManager).at(-1).rationale, "Not a durable change");
   assert.deepEqual(errors, []);
@@ -855,12 +971,15 @@ test("review boosts original evidence despite a tool echo and counts repeated re
     fauxAssistantMessage("Only the newly verified incident counted."),
   ]);
   await session.prompt(correction);
+  await waitForReviews(sessionManager, 1);
   assert.ok(originalId && echoId && originalId !== echoId);
   assert.deepEqual(await store.read(note.id), { ...note, weight: 1 });
   await session.prompt(correction);
+  await waitForReviews(sessionManager, 2);
   assert.ok(repeatedId && repeatedId !== originalId);
   assert.deepEqual(await store.read(note.id), { ...note, weight: 1 });
   await session.prompt("No, check the other test wrapper too.");
+  await waitForReviews(sessionManager, 3);
   assert.ok(distinctId && distinctId !== originalId);
   assert.deepEqual(await store.read(note.id), { ...note, weight: 2 });
   assert.deepEqual(rows(sessionManager).map(({ status }) => status), ["Saved · 1", "Skipped", "Saved · 1"]);
@@ -882,6 +1001,7 @@ test("a rejected reinforcement citation skips review without marking a tool fail
     fauxAssistantMessage("No valid evidence citation."),
   ]);
   await session.prompt(correction);
+  await waitForReviews(sessionManager, 1);
   assert.deepEqual(await store.read(note.id), note);
   const [review] = rows(sessionManager);
   assert.equal(review.status, "Skipped");
@@ -955,13 +1075,13 @@ test("link command and opt-in batches judge stored embeddings with active model"
   const third = await store.add({ scope: "global", kind: "preference", text: "Run checks after editing" }, embedding);
   faux.setResponses([fauxAssistantMessage("Ordinary answer"), judge]);
   await session.prompt("Turn to trigger background linking");
+  await waitFor(async () => (await store.list("global", true)).length === 0, "automatic linking");
   assert.deepEqual(judged.slice(2), [third.id]);
-  assert.deepEqual(await store.list("global", true), []);
   assert.deepEqual(errors, []);
   assert.deepEqual(alerts.filter(([, level]) => level === "error"), []);
 });
 
-test("flush precedes summarization and compaction refresh follows prior injection", async (t) => {
+test("compaction and injection refresh finish while a pre-compaction review is still running", { timeout: 10000 }, async (t) => {
   const { session, note, faux, directory, errors, alerts, sessionManager } = await fixture(t);
   await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
   faux.setResponses(Array.from({ length: 6 }, (_, i) => fauxAssistantMessage(`Assistant text ${i}`)));
@@ -970,13 +1090,15 @@ test("flush precedes summarization and compaction refresh follows prior injectio
   await session.prompt("/psm-inject");
   assert.equal(injections(sessionManager).length, 1);
   const stages = [];
+  const held = Promise.withResolvers();
+  t.after(() => held.resolve(fauxAssistantMessage("Nothing durable for memory")));
   faux.appendResponses([
     (ctx) => {
       stages.push("flush");
       assert.match(getCurrentSystemPrompt(ctx.messages), /Before this context boundary/);
       assert.match(text(ctx.messages), /User text 0/);
       assert.match(text(ctx.messages), /User text 5/);
-      return fauxAssistantMessage("Nothing durable for memory");
+      return held.promise;
     },
     () => { stages.push("summary"); return fauxAssistantMessage("Fixture summary of earlier conversation"); },
     (ctx) => {
@@ -989,6 +1111,9 @@ test("flush precedes summarization and compaction refresh follows prior injectio
   await session.compact();
   assert.deepEqual(stages, ["flush", "summary", "refresh"]);
   assert.equal(injections(sessionManager).length, 2);
+  assert.deepEqual(rows(sessionManager), []);
+  held.resolve(fauxAssistantMessage("Nothing durable for memory"));
+  await waitForReviews(sessionManager, 1);
   assert.deepEqual(rows(sessionManager).map(({ trigger, status }) => [trigger, status]), [["flush", "Skipped"]]);
   assert.deepEqual(errors, []);
   assert.deepEqual(alerts.filter(([, level]) => level === "error"), []);
@@ -1039,16 +1164,15 @@ test("timed-out pre-compaction review cannot block a later review or start a wri
   ]);
   try {
     await session.compact();
-    assert.equal(rows(sessionManager).at(-1).status, "Failed");
-    assert.match(rows(sessionManager).at(-1).error, /TimeoutError/);
+    assert.deepEqual(rows(sessionManager), []);
     assert.equal(injections(sessionManager).length, 0);
     assert.ok(sessionManager.getEntries().some((entry) => entry.type === "compaction"));
-    const next = session.prompt("No, use the updated fixture.");
-    let deadline;
-    try {
-      await Promise.race([next, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("Next turn blocked by expired review")), 3_000); })]);
-      assert.equal(rows(sessionManager).at(-1).rationale, "Correction reviewed while old provider was pending");
-    } finally { clearTimeout(deadline); }
+    await session.prompt("No, use the updated fixture.");
+    await waitForReviews(sessionManager, 2);
+    const [flush, correction] = rows(sessionManager);
+    assert.equal(flush.status, "Failed");
+    assert.match(flush.error, /TimeoutError/);
+    assert.equal(correction.rationale, "Correction reviewed while old provider was pending");
   } finally { releaseLate?.(); }
   await late;
   assert.deepEqual(await store.read(note.id), note);
