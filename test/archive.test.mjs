@@ -46,10 +46,33 @@ test("backfill is idempotent and prune never writes original Pi transcripts", as
   assert.equal(matches.length, 1);
   assert.equal(matches[0].path, path);
   assert.match(matches[0].text, /Historical unicorn detail/);
-  assert.deepEqual(await a.searchTranscripts("unicorn", path), []);
+  assert.deepEqual(await a.searchTranscripts("unicorn", { exclude: path }), []);
   await a.prune();
   assert.deepEqual(await a.searchTranscripts("unicorn"), []);
   assert.deepEqual(await readFile(path), original);
+});
+
+test("transcript search filters by exact working directory and author independently or together", async (t) => {
+  const { root, a } = await fixture(t);
+  const exact = join(root, "first", "addon");
+  const sameName = join(root, "second", "addon");
+  const nested = join(exact, "src");
+  const current = join(root, "current.jsonl");
+  const timestamp = "2026-01-01T00:00:00Z";
+  const index = (path, cwd, roles) => a.index(path, [
+    { type: "session", id: path, version: 3, cwd },
+    ...roles.map((role) => ({ type: "message", id: role, timestamp, message: { role, content: "Pineapple detail" } })),
+  ]);
+  await index(join(root, "first.jsonl"), exact, ["user", "assistant"]);
+  await index(join(root, "second.jsonl"), sameName, ["user"]);
+  await index(join(root, "nested.jsonl"), nested, ["user"]);
+  await index(current, exact, ["user"]);
+  const search = (filters) => a.searchTranscripts("pineapple", { exclude: current, ...filters });
+  assert.equal((await search()).length, 4);
+  assert.deepEqual((await search({ project: exact })).map(({ cwd, role }) => [cwd, role]).sort(), [[exact, "assistant"], [exact, "user"]]);
+  assert.deepEqual((await search({ role: "user" })).map(({ cwd }) => cwd).sort(), [exact, sameName, nested].sort());
+  assert.deepEqual((await search({ project: exact, role: "user" })).map(({ cwd, role }) => [cwd, role]), [[exact, "user"]]);
+  assert.deepEqual(await search({ project: "addon" }), []);
 });
 
 test("stale backfill snapshot does not delete a later indexed message", async (t) => {

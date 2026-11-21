@@ -70,9 +70,9 @@ export async function runBatches(options: BatchOptions, title: string, decide: (
   return result;
 }
 
-export async function reclassifyMemories(options: BatchOptions, sessionSearch: Operation): Promise<MaintenanceResult> {
+export async function reclassifyMemories(options: BatchOptions, sessionSearch: Operation, cwd: string): Promise<MaintenanceResult> {
   const { store, settings } = options;
-  const task = [prompt(settings, "classification"), prompt(settings, "reclassify")].join("\n\n");
+  const task = [prompt(settings, "classification"), prompt(settings, "sessionSearch"), prompt(settings, "reclassify")].join("\n\n");
   return runBatches(options, "Reclassifying", async (fields, notes) => {
     let changes = 0;
     const tool = operation(toolNames.reclassify, "After any needed session searches, submit changed kinds using IDs from this batch. Submit an empty updates list if none.",
@@ -81,7 +81,7 @@ export async function reclassifyMemories(options: BatchOptions, sessionSearch: O
         changes = await store.reclassify(classified, signal);
         return { value: { changes } };
       });
-    await requestDecision(options, fields, task, { notes }, tool, sessionSearch);
+    await requestDecision(options, fields, task, { cwd, notes }, tool, sessionSearch);
     return changes;
   });
 }

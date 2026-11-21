@@ -400,6 +400,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
     const memoryExposed = tools.some(({ name }) => active.has(name));
     const guidance = memoryExposed ? [prompt(settings, "precedence"), prompt(settings, "recall"), prompt(settings, "write")] : [];
     if (active.has(toolNames.memoryAdd)) guidance.push(prompt(settings, "classification"));
+    if (active.has(toolNames.sessionSearch)) guidance.push(prompt(settings, "sessionSearch"));
     if (main && active.has(toolNames.skillSave)) guidance.push(prompt(settings, "skillWrite"));
     if (pins.length) guidance.push(...pins);
     if (guidance.length) return { systemPrompt: [event.systemPrompt, ...guidance].join("\n\n") };
@@ -771,7 +772,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
 
   registerMaintenanceCommand(commands.reclassify, "Reclassify after Hermes import; searches indexed chats as needed (global includes global memories)", (args, ctx) =>
     batchJob(ctx, "reclassify", "Reclassifying memories", scopedMaintenance(project, args),
-      (changes) => `Reclassified ${changes} saved memories`, (options) => reclassifyMemories(options, sessionSearch)));
+      (changes) => `Reclassified ${changes} saved memories`, (options) => reclassifyMemories(options, sessionSearch, ctx.cwd)));
 
   registerMaintenanceCommand(commands.cleanupConflicts, "Clean up stored memory conflicts with guidance or other memories", (args, ctx) => {
     const mode = cleanupMode(args);

@@ -1,7 +1,7 @@
 import { clampThinkingLevel, validateToolCall, type AssistantMessage, type Message, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { contentText } from "./archive.ts";
-import { resultText, type Operation } from "./memory-tools.ts";
+import { resultText, toolNames, type Operation } from "./memory-tools.ts";
 import { prompt, type Settings } from "./settings.ts";
 
 const strong = ["don't do that", "not like that", "i said", "i told you", "we already discussed", "please don't", "that's not what i", "i never said", "i didn't ask for", "you misunderstood"];
@@ -106,7 +106,8 @@ export async function runModel(ctx: ModelContext, messages: Message[], task: str
 }
 
 export function reviewTask(settings: Settings, trigger: Trigger, request?: string) {
-  return [prompt(settings, "precedence"), prompt(settings, "write"), prompt(settings, "classification"), prompt(settings, "review"), prompt(settings, trigger), request && JSON.stringify(request)].filter(Boolean).join("\n\n");
+  const search = settings.reviewTools.includes(toolNames.sessionSearch) && prompt(settings, "sessionSearch");
+  return [prompt(settings, "precedence"), prompt(settings, "write"), prompt(settings, "classification"), search, prompt(settings, "review"), prompt(settings, trigger), request && JSON.stringify(request)].filter(Boolean).join("\n\n");
 }
 
 export function injectionText(entries: readonly string[], cap = 32 * 1024) {

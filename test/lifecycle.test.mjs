@@ -1191,14 +1191,15 @@ test("cleanup guidance-only dispatches a scoped decision without running memory 
   assert.deepEqual(errors, []);
 });
 
-test("foreground saves, automatic review, and reclassify share the default rubric and its override", async (t) => {
+test("foreground, automatic review, and reclassify share classification and session-search guidance", async (t) => {
   const { session, sessionManager, faux, directory, errors } = await fixture(t);
   const settings = new SettingsFile(directory);
-  await settings.update({ initialMessages: 100, periodicTurns: 100 });
-  const override = "Use the owner-edited classification rubric.";
+  const { reviewTools } = await settings.read();
+  await settings.update({ initialMessages: 100, periodicTurns: 100, reviewTools: [...reviewTools, "psm_session_search"] });
+  const override = { classification: "Use the owner-edited classification rubric.", sessionSearch: "Use the owner-edited session search guidance." };
   const seen = [];
-  for (const [index, rubric] of [prompts.classification, override].entries()) {
-    if (index) await settings.update({ prompts: { classification: override } });
+  for (const [index, rules] of [prompts, override].entries()) {
+    if (index) await settings.update({ prompts: override });
     faux.setResponses([
       ({ messages }) => {
         seen.push({ prompt: getCurrentSystemPrompt(messages), tools: getCurrentTools(messages) });
@@ -1218,8 +1219,11 @@ test("foreground saves, automatic review, and reclassify share the default rubri
     await session.prompt("/psm-reclassify global");
     const [foreground, review, reclassify] = seen.slice(index * 3);
     for (const observation of [foreground, review, reclassify]) {
-      assert.ok(observation.prompt.includes(rubric));
-      if (index) assert.ok(!observation.prompt.includes(prompts.classification));
+      for (const key of ["classification", "sessionSearch"]) {
+        assert.ok(observation.prompt.includes(rules[key]));
+        if (index) assert.ok(!observation.prompt.includes(prompts[key]));
+      }
+      assert.ok(observation.tools.some(({ name }) => name === "psm_session_search"));
     }
     assert.ok(foreground.tools.some(({ name }) => name === "psm_memory_add"));
     assert.match(review.prompt, /Explicit task fixture/);
@@ -1238,14 +1242,16 @@ test("reclassify can find past owner intent before submitting kind-only updates"
   const standing = "From now on, always verify release checks using the exit status.";
   const historical = SessionManager.create(cwd, join(cwd, "previous"));
   historical.appendMessage({ role: "user", content: standing, timestamp: Date.now() });
+  historical.appendMessage(fauxAssistantMessage("I’ll check the exit status."));
   await archive.index(historical.getSessionFile(), [historical.getHeader(), ...historical.getEntries()]);
   const searchResults = (messages) => messages.filter(({ role, toolName }) => role === "toolResult" && toolName === "psm_session_search")
     .map(({ content }) => JSON.parse(contentText(content)).result.map(({ role, text }) => ({ role, text })));
   const seen = [];
   faux.setResponses([
     ({ messages }) => {
-      seen.push({ notes: JSON.parse(text(messages)).notes, tools: getCurrentTools(messages), prompt: getCurrentSystemPrompt(messages) });
-      return fauxAssistantMessage(fauxToolCall("psm_session_search", { query: "exit status" }));
+      const input = JSON.parse(text(messages));
+      seen.push({ ...input, tools: getCurrentTools(messages), prompt: getCurrentSystemPrompt(messages) });
+      return fauxAssistantMessage(fauxToolCall("psm_session_search", { query: "exit status", project: input.cwd, role: "user" }));
     },
     ({ messages }) => {
       seen.push(searchResults(messages));
@@ -1258,6 +1264,7 @@ test("reclassify can find past owner intent before submitting kind-only updates"
   ]);
   await session.prompt("/psm-reclassify global");
   const [request, hit, allSearches] = seen;
+  assert.equal(request.cwd, cwd);
   assert.deepEqual(new Set(request.notes.map(({ id }) => id)), new Set([note.id, other.id]));
   assert.deepEqual(request.tools.map(({ name }) => name), ["psm_reclassify_batch", "psm_session_search"]);
   assert.match(request.prompt, /use psm_session_search with a focused query to look for the owner's original direction/);

@@ -14,7 +14,9 @@ export function contentText(content: unknown): string {
 
 type SkillDraft = { name: string; description: string; text: string; scope: Scope };
 type SkillRow = Omit<SkillDraft, "scope"> & { id: RecordId<"smart_skill", string>; project?: string };
-type TranscriptPart = { entry: string; role: "user" | "assistant"; text: string; timestamp: string };
+export const transcriptRoles = ["user", "assistant"] as const;
+type TranscriptPart = { entry: string; role: typeof transcriptRoles[number]; text: string; timestamp: string };
+type TranscriptSearch = { exclude?: string; project?: string; role?: TranscriptPart["role"] };
 const inScope = "(project = NONE OR ($project != NONE AND project = $project))";
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const skill = ({ id, project, ...row }: SkillRow) => ({ ...row, id: id.id, scope: project === undefined ? "Global" : "Project" });
@@ -96,11 +98,12 @@ export class Archive {
     return parts.length;
   }
 
-  async searchTranscripts(query: string, exclude?: string) {
+  async searchTranscripts(query: string, { exclude, project, role }: TranscriptSearch = {}) {
     return withDatabase(this.#path, false, async (db) => {
-      const [rows] = await db.query<[{ text: string; session: string; cwd: string; entry: string; role: string; timestamp: string; path: string }[]]>(`
+      const [rows] = await db.query<[(TranscriptPart & { session: string; cwd: string; path: string })[]]>(`
         SELECT id, text, session, cwd, entry, role, timestamp, path, search::score(1) AS score FROM smart_transcript
-          WHERE ($exclude = NONE OR path != $exclude) AND text @1@ $query ORDER BY score DESC LIMIT 12`, { query, exclude });
+          WHERE ($exclude = NONE OR path != $exclude) AND ($project = NONE OR cwd = $project)
+            AND ($role = NONE OR role = $role) AND text @1@ $query ORDER BY score DESC LIMIT 12`, { query, exclude, project, role });
       return rows.map(({ text, ...row }) => {
         const hit = text.toLowerCase().indexOf(query.toLowerCase());
         const start = Math.max(0, hit - 600);

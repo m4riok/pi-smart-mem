@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { JsonObject, Tool } from "@earendil-works/pi-ai";
 import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static, type TSchema } from "typebox";
-import { contentText, type Archive } from "./archive.ts";
+import { contentText, transcriptRoles, type Archive } from "./archive.ts";
 import { memoryKinds, type Embedding, type MemoryStore } from "./memory-store.ts";
 
 const text = Type.String({ minLength: 1 });
@@ -43,8 +43,11 @@ export const currentToolName = (name: string) => oldToolNames.get(name) ?? name;
 export const lookupNames = [toolNames.memorySearch, toolNames.memoryRead, toolNames.memoryRelated, toolNames.memoryGlobalPreferences];
 
 export function sessionSearchTool(getArchive: () => Archive, sessionFile: () => string | undefined): Operation {
-  return operation(toolNames.sessionSearch, "Search text in indexed past Pi conversations.", Type.Object({ query: text }), async ({ query }) =>
-    ({ value: await getArchive().searchTranscripts(query, sessionFile()) }));
+  return operation(toolNames.sessionSearch, "Search text in indexed past Pi conversations.", Type.Object({
+    query: text,
+    project: Type.Optional(Type.String({ minLength: 1, description: "Exact full working directory (cwd) recorded by Pi. Omit to search all indexed projects." })),
+    role: Type.Optional(Type.Union(transcriptRoles.map((value) => Type.Literal(value)), { description: "Filter by message author role." })),
+  }), async ({ query, project, role }) => ({ value: await getArchive().searchTranscripts(query, { exclude: sessionFile(), project, role }) }));
 }
 
 export function memoryTools(getStore: () => MemoryStore, getArchive: () => Archive, embed: (text: string, query: boolean, signal?: AbortSignal) => Promise<Embedding>): Operation[] {
