@@ -7,5 +7,6 @@ export const commands = {
   inject: `${prefix}inject`,
   link: `${prefix}link`,
   consolidate: `${prefix}consolidate`,
+  reclassify: `${prefix}reclassify`,
   pin: `${prefix}pin`,
 } as const;

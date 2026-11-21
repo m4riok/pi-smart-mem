@@ -88,7 +88,7 @@ const injections = (sessionManager) => sessionManager.getEntries().filter((e) =>
 test("unconfigured startup warns without opening the picker; setup command asks before creating storage", async (t) => {
   const { session, dialogs, directory, alerts, errors, faux } = await fixture(t, { setup: true });
   assert.deepEqual(session.extensionRunner.getRegisteredCommands().map(({ name }) => name).sort(), [
-    "psm-consolidate", "psm-inject", "psm-link", "psm-migrate-hermes", "psm-pin", "psm-settings", "psm-setup",
+    "psm-consolidate", "psm-inject", "psm-link", "psm-migrate-hermes", "psm-pin", "psm-reclassify", "psm-settings", "psm-setup",
   ]);
   assert.deepEqual(dialogs, []);
   assert.ok(alerts.some(([message, level]) => level === "warning" && message.includes("/psm-setup")));
@@ -515,6 +515,26 @@ test("review boosts once per incident, including independently verified evidence
   await session.prompt("Check the other test wrapper.");
   await session.prompt("Show the status.");
   assert.deepEqual(await store.read(note.id), { ...note, weight: 2 });
+  assert.deepEqual(errors, []);
+});
+
+test("reclassify batches scoped memories and changes only kind", async (t) => {
+  const { session, faux, store, note, errors, alerts } = await fixture(t);
+  const vector = { model: models[0].model, values: [1, ...Array(models[0].dimensions - 1).fill(0)] };
+  const other = await store.add({ scope: "global", kind: "note", text: "Other global memory" }, vector);
+  await store.link(note.id, other.id);
+  await store.reinforce(note.id, "fixture-incident");
+  const before = await store.read(note.id);
+  faux.setResponses([({ messages }) => {
+    const { notes } = JSON.parse(text(messages));
+    assert.deepEqual(new Set(notes.map(({ id }) => id)), new Set([note.id, other.id]));
+    assert.deepEqual(getCurrentTools(messages).map(({ name }) => name), ["psm_reclassify_batch"]);
+    return fauxAssistantMessage(fauxToolCall("psm_reclassify_batch", { updates: [{ id: note.id, kind: "guideline" }] }));
+  }]);
+  await session.prompt("/psm-reclassify global");
+  assert.deepEqual(await store.read(note.id), { ...before, kind: "guideline" });
+  assert.deepEqual(await store.related(note.id), [other]);
+  assert.ok(alerts.some(([message]) => message === "Reclassified 1 saved memories"));
   assert.deepEqual(errors, []);
 });
 

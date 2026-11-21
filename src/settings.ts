@@ -32,6 +32,7 @@ Reply with exactly one ${toolNames.consolidateNote} tool call, not prose, even i
 - No change: {"ids":[]} (omit text).
 - Shorten the source only: {"ids":[],"text":"<complete replacement text>"}.
 - Merge: supply the selected candidate IDs in ids and the complete replacement text in text.`,
+  reclassify: `Classify each supplied memory as guideline (clear owner-given standing direction, not just imperative wording), preference (preferred default, not mandatory), or note (other durable facts, decisions, or lessons). Do not infer owner endorsement from repetition. Do not rewrite text or change scope. Call ${toolNames.reclassify} once with only changed kinds and IDs from this batch. If none change, call it with {"updates":[]}.`,
   consolidateRetry: `The previous reply did not submit a decision. Call ${toolNames.consolidateNote} instead of replying in prose. To leave this note unchanged, call it with {"ids":[]} and omit text.`,
 };
 export type PromptKey = keyof typeof prompts;

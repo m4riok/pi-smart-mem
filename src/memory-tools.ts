@@ -32,6 +32,7 @@ export const toolNames = {
   selectMemories: `${prefix}select_memories`,
   selectLinks: `${prefix}select_links`,
   consolidateNote: `${prefix}consolidate_note`,
+  reclassify: `${prefix}reclassify_batch`,
 };
 
 const oldToolNames = new Map(Object.values(toolNames).map((name) => [name.slice(prefix.length), name]));

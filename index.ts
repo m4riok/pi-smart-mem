@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
-import { convertToLlm, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Message } from "@earendil-works/pi-ai";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -10,6 +10,7 @@ import { embeddingDevice, models, type Device, type ModelPreset, type Progress }
 import { migrateHermes } from "./src/hermes-migration.ts";
 import { readHermesSource } from "./src/hermes-source.ts";
 import { maintain, type MaintenanceResult } from "./src/maintenance.ts";
+import { reclassifyMemories, type BatchOptions } from "./src/maintenance-batch.ts";
 import { Diagnostics } from "./src/diagnostics.ts";
 import { commands } from "./src/commands.ts";
 import { MemoryPanel, memoryPanelShortcut, type Activity, type Level } from "./src/memory-panel.ts";
@@ -558,9 +559,12 @@ export default function smartMemory(pi: ExtensionAPI): void {
       } catch (error) { reportError(ctx, error); }
     },
   });
-  for (const [kind, command] of [["link", commands.link], ["consolidate", commands.consolidate]] as const) registerCommand(command, {
-    description: kind === "link" ? "Build related-memory links" : "Merge overlapping saved memories and shorten notes",
-    handler: async (args, ctx) => {
+  type Job = {
+    kind: string; title: string; scopes: Scope[]; summary: (changes: number) => string; refresh?: boolean;
+    run: (report: Progress, signal: AbortSignal) => Promise<MaintenanceResult>;
+  };
+  function registerMaintenanceCommand(command: string, description: string, prepare: (args: string, ctx: ExtensionCommandContext) => Job) {
+    registerCommand(command, { description, handler: async (args, ctx) => {
       const background = ctx.mode === "tui";
       if (!background) await ctx.waitForIdle();
       if (manualMaintenance) {
@@ -568,22 +572,11 @@ export default function smartMemory(pi: ExtensionAPI): void {
         return;
       }
       try {
-        const scopes = scopedMaintenance(project, args);
-        const target = getStore();
-        const messages = kind === "link" ? withActiveContext(projected(ctx)) : [];
-        const systemPrompt = kind === "link" ? ctx.getSystemPrompt() : "";
-        const modelContext = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel,
-          getSystemPrompt: () => systemPrompt };
-        const title = kind === "link" ? "Building memory links" : "Consolidating memories";
+        const { kind, title, scopes, summary, run, refresh } = prepare(args, ctx);
         const controller = new AbortController();
         const foregroundSignal = background ? undefined : ctx.signal;
         const signal = foregroundSignal ? AbortSignal.any([controller.signal, foregroundSignal]) : controller.signal;
-        const run = async (report: Progress) => runMaintenance({
-          kind, scopes, ctx: modelContext, store: target, settings: await file.read(), messages,
-          embed: (text, signal) => embed(text, false, signal), progress: report, signal,
-        });
-        const result = ({ changes, skipped }: MaintenanceResult) =>
-          (kind === "link" ? `Created ${changes} memory links` : `Updated ${changes} saved memories`) + skipSummary(skipped);
+        const result = ({ changes, skipped }: MaintenanceResult) => summary(changes) + skipSummary(skipped);
         const activity = begin(ctx, title);
         manualMaintenance = controller;
         const finish = () => { if (manualMaintenance === controller) manualMaintenance = undefined; };
@@ -591,8 +584,8 @@ export default function smartMemory(pi: ExtensionAPI): void {
           // Keep the command handler out of Pi's input loop once work starts.
           void (async () => {
             try {
-              const outcome = await run(activity.update);
-              if (!signal.aborted && kind === "consolidate" && outcome.changes) await refreshCounts(ctx);
+              const outcome = await run(activity.update, signal);
+              if (!signal.aborted && refresh && outcome.changes) await refreshCounts(ctx);
               if (!signal.aborted) activity.finish(result(outcome), "info", `Scope: ${scopes.join(" and ")}${outcome.skipped ? "\nSee smart-mem.log for skipped notes." : ""}`);
             } catch (error) {
               if (!signal.aborted) {
@@ -603,13 +596,54 @@ export default function smartMemory(pi: ExtensionAPI): void {
           })().catch((error) => { if (!signal.aborted) reportError(ctx, error); });
         } else {
           try {
-            const changes = await progress(ctx, title, run);
+            const changes = await progress(ctx, title, (report) => run(report, signal));
             if (!signal.aborted) notify(ctx, result(changes));
           } finally { finish(); }
         }
       } catch (error) { reportError(ctx, error); }
-    },
-  });
+    } });
+  }
+
+  for (const [kind, command] of [["link", commands.link], ["consolidate", commands.consolidate]] as const) {
+    const link = kind === "link";
+    registerMaintenanceCommand(command, link ? "Build related-memory links" : "Merge overlapping saved memories and shorten notes", (args, ctx) => {
+      const scopes = scopedMaintenance(project, args);
+      const target = getStore();
+      const messages = link ? withActiveContext(projected(ctx)) : [];
+      const systemPrompt = link ? ctx.getSystemPrompt() : "";
+      const modelContext = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel, getSystemPrompt: () => systemPrompt };
+      return { kind, scopes, title: link ? "Building memory links" : "Consolidating memories", refresh: !link,
+        summary: (changes) => link ? `Created ${changes} memory links` : `Updated ${changes} saved memories`,
+        run: async (report, signal) => runMaintenance({
+          kind, scopes, ctx: modelContext, store: target, settings: await file.read(), messages,
+          embed: (text, signal) => embed(text, false, signal), progress: report, signal,
+        }),
+      };
+    });
+  }
+
+  function batchJob(ctx: ExtensionCommandContext, kind: string, title: string, scopes: Scope[], summary: Job["summary"],
+    action: (options: BatchOptions) => Promise<MaintenanceResult>, refresh = false): Job {
+    const target = getStore();
+    const model = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel, getSystemPrompt: () => "" };
+    const batch = { kind, scopes: scopes.join(","), model: model.model?.id };
+    return { kind, title, scopes, summary, refresh, run: async (report, signal) => {
+      void log.write("maintenance.start", batch);
+      const result = await action({ ctx: model, store: target, scopes, signal, settings: await file.read(), progress: (message) => {
+        void log.write("maintenance.progress", { ...batch, message });
+        report(message);
+      }, onFailure: (scope, ids, attempt, reason) => {
+        void log.write("maintenance.batch_failed", { ...batch, scope, ids: ids.join(","), attempt, reason }, "warning");
+      } });
+      void log.write("maintenance.finish", { ...batch, ...result }, result.skipped ? "warning" : "info");
+      return result;
+    } };
+  }
+
+  registerMaintenanceCommand(commands.reclassify, "Review and update stored memory kinds", (args, ctx) =>
+    batchJob(ctx, "reclassify", "Reclassifying memories", scopedMaintenance(project, args),
+      (changes) => `Reclassified ${changes} saved memories`, reclassifyMemories));
+
   registerCommand(commands.pin, {
     description: "Save standing instructions for this project or globally",
     handler: async (args, ctx) => {

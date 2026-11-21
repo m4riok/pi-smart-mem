@@ -211,6 +211,23 @@ export class MemoryStore {
     });
   }
 
+  async reclassify(changes: readonly { note: Memory; kind: MemoryKind }[], signal?: AbortSignal): Promise<number> {
+    if (!changes.length) return 0;
+    return this.#use(async (db) => {
+      const updates = [];
+      for (const { note, kind } of changes) {
+        const current = await this.#read(db, note.id);
+        if (current && current.revisedAt === note.revisedAt && current.text === note.text && current.kind === note.kind && current.kind !== kind) {
+          updates.push({ id: record(note.id), kind });
+        }
+      }
+      if (!updates.length) return 0;
+      signal?.throwIfAborted();
+      await db.query("BEGIN TRANSACTION; FOR $change IN $updates { UPDATE $change.id SET kind = $change.kind; }; COMMIT TRANSACTION;", { updates });
+      return updates.length;
+    });
+  }
+
   async reinforce(id: string, incident: string, signal?: AbortSignal): Promise<boolean> {
     return this.#use(async (db) => {
       if (!await this.#read(db, id)) return false;
