@@ -256,4 +256,4 @@ Small fixes can go straight to a pull request. If your change affects what Smart
    npm test
    ```
 
-3. **Open a focused pull request.** Explain what changed, why, and how you tested it. For platform-specific changes, include which OS you tested.
+3. **Open a focused pull request.** Explain what changed, why, and how you tested it. For platform-specific changes, include which OS you tested. GitHub Actions runs the same checks on Linux, Windows, and macOS; make sure they pass before merging.
