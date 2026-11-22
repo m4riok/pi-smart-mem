@@ -10,6 +10,7 @@ import { withFileLock } from "./file-lock.ts";
 import type { Diagnostics } from "./diagnostics.ts";
 import type { Pin } from "./archive.ts";
 import { databaseAccessModes, type DatabaseAccessMode } from "./database-access.ts";
+import { explicit, negative, normalizePhrase, strong, weak } from "./trigger-phrases.ts";
 import { currentToolName, toolNames } from "./memory-tools.ts";
 
 export const minConsolidationSavings = { characters: 30, percent: 5 } as const;
@@ -195,6 +196,29 @@ async function settingsMenu(ctx: ExtensionContext, settings: Settings, modelName
   });
 }
 
+async function toggleChecklist(ctx: ExtensionContext, title: string, items: ReadonlyMap<string, string>, checked: Set<string>) {
+  for (;;) {
+    const choices = [...items].map(([key, label]) => [`${checked.has(key) ? "✓" : "○"} ${label}`, key] as const);
+    const selected = await ctx.ui.select(title, [...choices.map(([label]) => label), "Save", "Cancel"]);
+    if (selected === "Save") return [...checked];
+    if (!selected || selected === "Cancel") return;
+    const key = choices.find(([label]) => label === selected)![1];
+    if (!checked.delete(key)) checked.add(key);
+  }
+}
+
+function exclusionChecklist(ctx: ExtensionContext, settings: Settings) {
+  const items = new Map<string, string>();
+  for (const phrase of [...explicit, ...strong, ...weak, ...settings.include]) {
+    const key = normalizePhrase(phrase);
+    if (key && !items.has(key)) items.set(key, `Trigger: ${phrase}`);
+  }
+  for (const phrase of negative) {
+    items.set(phrase, `${items.has(phrase) ? "Trigger and suppressor" : "Suppressor"}: ${phrase}`);
+  }
+  return toggleChecklist(ctx, "Toggle excluded phrases (✓ = excluded)", items, new Set(settings.exclude.map(normalizePhrase)));
+}
+
 export async function openSettings(ctx: ExtensionContext, file: SettingsFile, reviewTools: string[], actions: SettingsActions & { model: () => ModelPreset | undefined }) {
   if (!ctx.hasUI) throw new Error("Smart Mem settings require interactive Pi");
   for (;;) {
@@ -236,22 +260,19 @@ export async function openSettings(ctx: ExtensionContext, file: SettingsFile, re
         break;
       }
       case 4: {
-        const active = new Set(s.reviewTools);
-        for (;;) {
-          const choices = reviewTools.map((name) => `${active.has(name) ? "✓" : "○"} ${name}`);
-          const selected = await ctx.ui.select("Toggle review tools", [...choices, "Save", "Cancel"]);
-          if (selected === "Save") { await file.update({ reviewTools: [...active] }); break; }
-          if (!selected || selected === "Cancel") break;
-          const name = reviewTools[choices.indexOf(selected)];
-          if (!active.delete(name)) active.add(name);
-        }
+        const enabled = await toggleChecklist(ctx, "Toggle review tools", new Map(reviewTools.map((name) => [name, name])), new Set(s.reviewTools));
+        if (enabled !== undefined) await file.update({ reviewTools: enabled });
         break;
       }
       case 5: {
         const key = await ctx.ui.select("Correction phrase settings", ["include", "exclude"]);
-        if (key !== "include" && key !== "exclude") break;
-        const edited = await ctx.ui.editor(`${key} — one phrase per line`, s[key].join("\n"));
-        if (edited !== undefined) await file.update({ [key]: edited.split("\n").map((part) => part.trim()).filter(Boolean) });
+        if (key === "exclude") {
+          const excluded = await exclusionChecklist(ctx, s);
+          if (excluded !== undefined) await file.update({ exclude: excluded });
+        } else if (key === "include") {
+          const edited = await ctx.ui.editor("include — one phrase per line", s.include.join("\n"));
+          if (edited !== undefined) await file.update({ include: edited.split("\n").map((part) => part.trim()).filter(Boolean) });
+        }
         break;
       }
       case 6: {

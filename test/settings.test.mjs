@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { embeddingDevice, models } from "../src/embeddings.ts";
-import { chooseEmbeddingModel, enableWindowsGpu, SettingsFile } from "../src/settings.ts";
+import { detectTrigger } from "../src/review.ts";
+import { chooseEmbeddingModel, enableWindowsGpu, openSettings, SettingsFile } from "../src/settings.ts";
 
 function picker(unavailable) {
   let panel;
@@ -68,6 +69,40 @@ test("setup picker permits explicit GPU selection when ready and keeps CPU as th
   gpu.panel.handleInput(confirm);
   assert.equal(await gpu.result, models[firstGpu]);
   assert.equal(embeddingDevice(await gpu.result, "cpu"), "cuda");
+});
+
+test("Exclude lists active and excluded phrases and applies only saved toggles", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "smart-mem-settings-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = new SettingsFile(dir);
+  const initial = { include: ["My correction"], exclude: ["I   Told You", "old custom phrase"] };
+  await file.update(initial);
+
+  async function editExclusions(...picks) {
+    const answers = ["Trigger phrases: Edit", "exclude", ...picks];
+    await openSettings({ mode: "rpc", hasUI: true, ui: {
+      select: async (title, options) => {
+        if (title.startsWith("Toggle excluded phrases")) {
+          assert.ok(options.includes("○ Trigger: remember this"));
+          assert.ok(options.includes("○ Trigger: no"));
+          assert.ok(options.includes("○ Suppressor: no thanks"));
+        }
+        const next = answers.shift();
+        if (next !== undefined) assert.ok(options.includes(next), `${title}: missing ${next}`);
+        return next;
+      },
+    } }, file, [], { model: () => undefined, databaseAccess: () => "Disabled" });
+    assert.equal(answers.length, 0);
+  }
+
+  await editExclusions("✓ Trigger: i told you", "○ Trigger: My correction", "Cancel");
+  assert.deepEqual((await file.read()).exclude, initial.exclude);
+  await editExclusions("✓ Trigger: i told you", "○ Trigger: My correction", "Save");
+  const saved = await file.read();
+  assert.deepEqual(saved.exclude, ["old custom phrase", "my correction"]);
+  assert.deepEqual(saved.include, initial.include);
+  assert.equal(detectTrigger("I told you to use that.", saved), "correction");
+  assert.equal(detectTrigger("My correction: use that.", saved), undefined);
 });
 
 test("concurrent settings writers preserve sibling settings and prompt edits", async (t) => {

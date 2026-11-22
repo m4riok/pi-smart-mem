@@ -3,12 +3,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { contentText } from "./archive.ts";
 import { resultText, toolNames, type Operation } from "./memory-tools.ts";
 import { prompt, type Settings } from "./settings.ts";
-
-const strong = ["don't do that", "not like that", "i said", "i told you", "we already discussed", "please don't", "that's not what i", "i never said", "i didn't ask for", "you misunderstood"];
-const weak = ["no", "wrong", "actually", "stop"];
-const explicit = ["remember this", "remember that", "save this as a memory", "save this to memory"];
-const negative = ["no worries", "no problem", "no thanks", "no need", "actually looks good", "actually looks great", "actually that's perfect", "actually that's correct", "actually that's right", "stop there", "stop here", "stop for now"];
-const normalize = (text: string) => text.toLowerCase().replace(/[’‘]/g, "'").replace(/\s+/g, " ").trim();
+import { explicit, negative, normalizePhrase, strong, weak } from "./trigger-phrases.ts";
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const includes = (text: string, phrase: string) => new RegExp(`(?:^|\\W)${escape(phrase)}(?:$|\\W)`).test(text);
 
@@ -16,8 +11,8 @@ export type Trigger = "correction" | "explicit" | "periodic" | "flush";
 export type UserTrigger = { kind: "correction" | "explicit"; text: string };
 
 export function detectTrigger(text: string, settings: Pick<Settings, "include" | "exclude">): UserTrigger["kind"] | undefined {
-  const clean = normalize(text.replace(/```[\s\S]*?```|`[^`]*`|["“][^"”]*["”]|(?<!\w)['‘][^'’\n]*['’](?!\w)|^\s*>[^\n]*/gm, " "));
-  const excluded = new Set(settings.exclude.map(normalize));
+  const clean = normalizePhrase(text.replace(/```[\s\S]*?```|`[^`]*`|["“][^"”]*["”]|(?<!\w)['‘][^'’\n]*['’](?!\w)|^\s*>[^\n]*/gm, " "));
+  const excluded = new Set(settings.exclude.map(normalizePhrase));
   const active = (phrase: string) => !excluded.has(phrase);
   // Allow a direct instruction after a scope preamble without treating every
   // mention of the phrase as a command (e.g. "If I say remember this...").
@@ -33,7 +28,7 @@ export function detectTrigger(text: string, settings: Pick<Settings, "include" |
     }
   }
   const effective = negative.filter(active).reduce((s, phrase) => s.replace(new RegExp(`\\b${escape(phrase)}\\b`, "g"), " "), clean).trim();
-  if ([...strong, ...settings.include.map(normalize)].some((phrase) => phrase && active(phrase) && includes(effective, phrase))) return "correction";
+  if ([...strong, ...settings.include.map(normalizePhrase)].some((phrase) => phrase && active(phrase) && includes(effective, phrase))) return "correction";
   const directive = /^(?:(?:please|instead)\s+)*(?:don't|do not|never|always|use|run|keep|change|replace|remove|add|make|fix|update|put|leave|set|switch|follow|check|write|read|prefer|avoid|only|stop|start|revert|undo|work|open|close|move|don't|you (?:must|should|need to|have to)|i (?:want|need) you to)\b/;
   for (const phrase of weak.filter(active)) {
     const tail = effective.match(new RegExp(`^${phrase}\\b[\\s,:;.!–—-]*([\\s\\S]+)$`))?.[1];
