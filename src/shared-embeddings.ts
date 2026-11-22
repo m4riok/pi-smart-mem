@@ -1,4 +1,4 @@
-import { fork, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, realpath } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
 import { join } from "node:path";
@@ -167,8 +167,9 @@ export class SharedEmbeddings {
     }
     const profile = canonical ?? await realpath(this.#profile);
     signal?.throwIfAborted();
-    const child = fork(fileURLToPath(new URL("./embedding-worker-entry.mjs", import.meta.url)), [profile], {
-      detached: true, execArgv: ["--disable-warning=ExperimentalWarning"], stdio: ["ignore", "ignore", "ignore", "ipc"],
+    const entry = fileURLToPath(new URL("./embedding-worker-entry.mjs", import.meta.url));
+    const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", entry, profile], {
+      detached: true, windowsHide: true, stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
     try {
       await workerReady(child, signal);

@@ -1,4 +1,4 @@
-import { fork } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -25,8 +25,8 @@ else {
     try { writeFileSync(join(profile, "embedding-worker", "diagnostics-error"), String(error).slice(0, 8192), { mode: 0o600 }); }
     catch (failure) { console.error(`Smart Mem worker diagnostics unavailable: ${String(failure)}`); }
   });
-  const child = fork(process.argv[1], [profile, "serve"], {
-    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  const child = spawn(process.execPath, [...process.execArgv, process.argv[1], profile, "serve"], {
+    windowsHide: true, stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   const disconnect = () => { if (child.connected) child.disconnect(); };
   process.once("disconnect", disconnect);
