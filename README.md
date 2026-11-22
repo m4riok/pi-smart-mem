@@ -90,19 +90,19 @@ Then run `/psm-setup` and choose a GPU embedding model. If you've already set up
 
 | Feature | What it does |
 | --- | --- |
-| 🧠 **Persistent memory** | Keep guidelines, preferences, and lessons across sessions. Save them for one project or make them available across projects. |
-| 🔎 **Hybrid search** | Find memories by exact terms or by meaning, even when you don't remember the original wording. |
-| 🎯 **Auto recall** | Automatically brings relevant memories into the current conversation without loading everything you've saved. Use `/psm-inject` to bring in relevant context on demand. |
-| 🔗 **Memory links** | Connect notes that are useful together, even when they aren't similar enough to show up in the same search. |
-| 💬 **Session search** | Find details in past Pi conversations that were never saved as memories. |
-| ⚡ **Auto review** | Decides what's worth remembering, whether to add a new memory, update or reinforce an existing one, or skip it. For new memories, it chooses the kind and whether they belong to the project or should be available globally. |
-| ⚙️ **Review setup** | Choose which model reviews your conversations, how often it runs, and what instructions it follows when deciding what to save. |
-| ⚖️ **Weights** | Reinforce an existing memory when a fresh correction or verified recurrence confirms it, instead of saving another copy. |
-| 🧹 **Consolidation** | Merge overlapping memories so the same advice doesn't live in several places. |
-| 🧩 **Conflict cleanup** | Find and clean up contradictions between memories or with standing instructions. |
-| 🧭 **Priority rules** | Saved memories provide context, not authority. Your current request and applicable project instructions take precedence. |
-| 📌 **Pins** | Keep standing instructions available without relying on search to find them. |
-| 📚 **Reusable skills** | Pi can decide on its own to save a useful procedure as a skill so it can reuse what worked next time. |
+| 🧠&nbsp;**Persistent&nbsp;memory** | Keep guidelines, preferences, and lessons across sessions. Save them for one project or make them available across projects. |
+| 🔎&nbsp;**Hybrid&nbsp;search** | Find memories by exact terms or by meaning, even when you don't remember the original wording. |
+| 🎯&nbsp;**Auto&nbsp;recall** | Automatically brings relevant memories into the current conversation without loading everything you've saved. Use `/psm-inject` to bring in relevant context on demand. |
+| 🔗&nbsp;**Memory&nbsp;links** | Connect notes that are useful together, even when they aren't similar enough to show up in the same search. |
+| 💬&nbsp;**Session&nbsp;search** | Find details in past Pi conversations that were never saved as memories. |
+| ⚡&nbsp;**Auto&nbsp;review** | Decides what's worth remembering, whether to add a new memory, update or reinforce an existing one, or skip it. For new memories, it chooses the kind and whether they belong to the project or should be available globally. |
+| ⚙️&nbsp;**Review&nbsp;setup** | Choose which model reviews your conversations, how often it runs, and what instructions it follows when deciding what to save. |
+| ⚖️&nbsp;**Weights** | Reinforce an existing memory when a fresh correction or verified recurrence confirms it, instead of saving another copy. |
+| 🧹&nbsp;**Consolidation** | Merge overlapping memories so the same advice doesn't live in several places. |
+| 🧩&nbsp;**Conflict&nbsp;cleanup** | Find and clean up contradictions between memories or with standing instructions. |
+| 🧭&nbsp;**Priority&nbsp;rules** | Saved memories provide context, not authority. Your current request and applicable project instructions take precedence. |
+| 📌&nbsp;**Pins** | Keep standing instructions available without relying on search to find them. |
+| 📚&nbsp;**Reusable&nbsp;skills** | Pi can decide on its own to save a useful procedure as a skill so it can reuse what worked next time. |
 
 ## Make memory work your way
 
