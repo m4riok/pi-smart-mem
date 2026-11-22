@@ -35,15 +35,16 @@ async function listen(local: LocalEmbeddings, endpoint: Awaited<ReturnType<typeo
       work = work.then(async () => {
         if (disconnect.signal.aborted) return;
         const request = parseRequest(line);
+        const download = request.download ? (message: string) => send(socket, { kind: "progress", message }) : undefined;
         if (request.kind === "probe") {
-          send(socket, { kind: "probe", unavailable: await local.cudaUnavailable() });
+          const availability = await local.gpuAvailability(download, disconnect.signal);
+          send(socket, { kind: "probe", ...availability });
           return;
         }
         const model = models.find((model) => model.model === request.model);
         if (!model) throw new Error(`Unsupported Smart Mem embedding model: ${request.model}`);
         const embedding = await local.embed(model, request.device, request.text, {
-          query: request.query, signal: disconnect.signal,
-          download: request.download ? (message) => send(socket, { kind: "progress", message }) : undefined,
+          query: request.query, signal: disconnect.signal, download,
         });
         send(socket, { kind: "embedding", embedding });
       }).catch((error: unknown) => send(socket, { kind: "error", message: errorMessage(error) }));

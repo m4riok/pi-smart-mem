@@ -26,7 +26,7 @@ Pick up where you left off in [Pi](https://pi.dev/) without explaining everythin
 
 - 🧹 **Memory maintenance** — Merge overlapping notes, resolve conflicts, and review how memories are classified.
 
-- 💻 **Local storage and embeddings** — Keep the database and search on your machine. Embeddings run on CPU or compatible NVIDIA GPUs.
+- 💻 **Local storage and embeddings** — Keep the database and search on your machine. Embeddings run on CPU, or on compatible GPUs via DirectML on native Windows and CUDA on Linux / WSL.
 
 ## What Smart Mem adds
 
@@ -68,7 +68,17 @@ Pick up where you left off in [Pi](https://pi.dev/) without explaining everythin
 
    To make older Pi sessions searchable, use `/psm-settings` → **Transcript index** → **Backfill Pi sessions**.
 
-### Optional: NVIDIA GPU embeddings
+### Optional: GPU embeddings
+
+#### Native Windows (DirectML)
+
+Use a DirectX 12-capable GPU with a working driver. If the Visual C++ runtime is missing, install it. No manual npm install, CUDA, cuDNN, or Python is needed for Windows GPU setup.
+
+Run `/psm-setup` and select **Enable Windows GPU models**. Smart Mem downloads and checks the DirectML runtime in its profile. Once that succeeds, choose a GPU embedding model. If you've already set up Smart Mem, use `/psm-settings` → **Embedding model** to switch. CPU remains the default; opening the picker or choosing CPU doesn't download the DirectML runtime.
+
+**Qwen3-Embedding-0.6B:** With ONNX Runtime Node 1.31.1, this preset failed on Node.js 24.10.0 because of how the model's empty FP16 key/value cache is handled (`Tensor.data must be a typed array (4 or Float16Array) for float16 tensors, but got typed array (0).`). This is not a general DirectML failure. The preset worked on tested Node.js versions 22.23.5 and 24.22.3; these are not minimum requirements. If you hit this error, update to a current Node.js patch or choose another GPU preset, such as Jina Code, which worked on Node.js 24.10.0.
+
+#### Linux / WSL (NVIDIA CUDA)
 
 For GPU embeddings, set up an NVIDIA driver, CUDA 12, and cuDNN 9 for your OS. Make sure Smart Mem can load `onnxruntime-node` with the CUDA execution provider. It doesn't need to be installed in the Smart Mem profile.
 

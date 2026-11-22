@@ -8,8 +8,11 @@ import { pipeline } from "node:stream/promises";
 import type { Tokenizer } from "@huggingface/tokenizers";
 import type * as Ort from "onnxruntime-web";
 import type { Embedding } from "./memory-store.ts";
+import { directMLRuntime, hasDirectMLRuntime, installDirectMLRuntime } from "./directml-runtime.ts";
 
+// Keep the existing settings and worker wire value for the GPU device.
 export type Device = "cpu" | "cuda";
+export type GpuAvailability = { unavailable?: string; needsRuntime?: true };
 export type ModelPreset = {
   model: string; dimensions: number; size: string; revision: string; tokens: number;
   tier: Device; pooling: "mean" | "cls" | "last"; queryPrefix?: string; passagePrefix?: string; output?: string;
@@ -33,12 +36,24 @@ export const models: readonly ModelPreset[] = [
   { model: "onnx-community/Qwen3-Embedding-0.6B-ONNX", dimensions: 1024, size: "1.20 GB", revision: "c25a394dd583836952667c12f008335071b3f43d", tokens: 32768, tier: "cuda", pooling: "last", queryPrefix: "Instruct: Given a search query, retrieve relevant saved notes that answer the query.\nQuery:", decoder: { heads: 8, headSize: 128, weights: "onnx/model_fp16.onnx_data" } },
 ];
 export const embeddingDevice = (preset: ModelPreset | undefined, configured: Device): Device => preset?.tier === "cuda" ? "cuda" : configured;
-export const cudaRequirements = "To enable GPU embeddings, use a compatible NVIDIA GPU and install CUDA 12 + cuDNN 9 and ONNX Runtime Node with the CUDA provider.";
+const useDirectML = process.platform === "win32";
+export const embeddingDeviceLabel = (device: Device) => device === "cpu" ? "CPU" : useDirectML ? "DirectML" : "CUDA";
+export const gpuRequirements = useDirectML
+  ? "Windows GPU embeddings use DirectML and require a DirectX 12-capable GPU with a working driver and the Visual C++ runtime."
+  : "To enable GPU embeddings, use a compatible NVIDIA GPU and install CUDA 12 + cuDNN 9 and ONNX Runtime Node with the CUDA provider.";
+const enableDirectMLHint = "Select Enable Windows GPU models in the embedding model picker first.";
 export type Progress = (message: string) => void;
-type Runtime = Pick<typeof Ort, "Tensor" | "InferenceSession">;
+export type Runtime = Pick<typeof Ort, "Tensor" | "InferenceSession">;
 type Encoder = { runtime: Runtime; tokenizer: Tokenizer; session: Ort.InferenceSession };
 // ONNX opset 13: one float32 MatMul, two [1, 1] inputs a/b, one [1, 1] output c.
-const cudaProbe = Buffer.from("CAc6XgoRCgFhCgFiEgFjIgZNYXRNdWwSCmN1ZGEtcHJvYmVaEwoBYRIOCgwIARIICgIIAQoCCAFaEwoBYhIOCgwIARIICgIIAQoCCAFiEwoBYxIOCgwIARIICgIIAQoCCAFCAhAN", "base64");
+const gpuProbe = Buffer.from("CAc6XgoRCgFhCgFiEgFjIgZNYXRNdWwSCmN1ZGEtcHJvYmVaEwoBYRIOCgwIARIICgIIAQoCCAFaEwoBYhIOCgwIARIICgIIAQoCCAFiEwoBYxIOCgwIARIICgIIAQoCCAFCAhAN", "base64");
+
+function gpuSessionOptions(probe = false): Ort.InferenceSession.SessionOptions {
+  return useDirectML
+    ? { executionProviders: ["dml"], enableMemPattern: false, executionMode: "sequential",
+        ...(probe ? { extra: { session: { disable_cpu_ep_fallback: "1" } } } : {}) }
+    : { executionProviders: ["cuda"] };
+}
 
 function encodeInputs({ runtime, tokenizer, session }: Encoder, preset: ModelPreset, text: string, query: boolean | undefined) {
   const prefix = (query ? preset.queryPrefix : preset.passagePrefix) ?? "";
@@ -64,8 +79,9 @@ export class LocalEmbeddings {
   readonly #directory: string;
   constructor(directory: string) { this.#directory = directory; }
 
-  #cudaRuntime(): Runtime {
-    // Package is installed by the user in Smart Mem's profile, never by Smart Mem.
+  #gpuRuntime(): Runtime {
+    if (useDirectML) return directMLRuntime(this.#directory);
+    // CUDA is installed by the user, not by Smart Mem.
     return createRequire(join(this.#directory, "package.json"))("onnxruntime-node");
   }
 
@@ -75,19 +91,26 @@ export class LocalEmbeddings {
     this.#loaded = undefined;
   }
 
-  async cudaUnavailable(): Promise<string | undefined> {
-    if (this.#loaded?.device === "cuda") return undefined;
+  async gpuAvailability(download?: Progress, signal?: AbortSignal): Promise<GpuAvailability> {
+    if (this.#loaded?.device === "cuda") return {};
     try {
-      const runtime = this.#cudaRuntime();
+      if (useDirectML && !await hasDirectMLRuntime(this.#directory)) {
+        if (!download) return { needsRuntime: true, unavailable: enableDirectMLHint };
+        await installDirectMLRuntime(this.#directory, download, signal);
+      }
+      const runtime = this.#gpuRuntime();
       await this.close();
-      const session = await runtime.InferenceSession.create(cudaProbe, { executionProviders: ["cuda"] });
+      signal?.throwIfAborted();
+      const session = await runtime.InferenceSession.create(gpuProbe, gpuSessionOptions(true));
       try {
         const a = new runtime.Tensor("float32", new Float32Array([2]), [1, 1]);
-        if ((await session.run({ a, b: a })).c.data[0] !== 4) throw new Error("CUDA probe returned an unexpected result");
+        if ((await session.run({ a, b: a })).c.data[0] !== 4) throw new Error(`${embeddingDeviceLabel("cuda")} probe returned an unexpected result`);
       } finally { await session.release(); }
+      return {};
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND") return `Cannot load ONNX Runtime Node from ${this.#directory}.`;
-      return error instanceof Error ? error.message : String(error);
+      signal?.throwIfAborted();
+      if (!useDirectML && (error as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND") return { unavailable: `Cannot load ONNX Runtime Node from ${this.#directory}.` };
+      return { unavailable: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -95,7 +118,7 @@ export class LocalEmbeddings {
     query?: boolean; download?: Progress; signal?: AbortSignal;
   } = {}): Promise<Embedding> {
     options.signal?.throwIfAborted();
-    if (preset.tier === "cuda" && device !== "cuda") throw new Error(`${preset.model} requires CUDA`);
+    if (preset.tier === "cuda" && device !== "cuda") throw new Error(`${preset.model} requires ${embeddingDeviceLabel("cuda")}`);
     if (this.#loaded?.model !== preset.model || this.#loaded.device !== device) {
       await this.close();
       const encoder = await this.#load(preset, device, options.download, options.signal);
@@ -126,21 +149,26 @@ export class LocalEmbeddings {
         const ort = await import("onnxruntime-web");
         ort.env.wasm.numThreads = 1;
         runtime = ort;
-      } else runtime = this.#cudaRuntime();
+      } else {
+        if (useDirectML && !await hasDirectMLRuntime(this.#directory)) throw new Error(enableDirectMLHint);
+        runtime = this.#gpuRuntime();
+      }
       const { Tokenizer } = await import("@huggingface/tokenizers");
       const load = (name: string) => this.#artifact(preset, name, progress, signal);
       const tokenizer = new Tokenizer(JSON.parse(await readFile(await load("tokenizer.json"), "utf8")), JSON.parse(await readFile(await load("tokenizer_config.json"), "utf8")));
       const path = await load(preset.tier === "cpu" ? "onnx/model_quantized.onnx" : "onnx/model_fp16.onnx");
       if (preset.decoder) await load(preset.decoder.weights);
       signal?.throwIfAborted();
-      progress?.(`Loading ${preset.model} on ${device.toUpperCase()}`);
+      progress?.(`Loading ${preset.model} on ${embeddingDeviceLabel(device)}`);
       const session = device === "cpu"
         ? await runtime.InferenceSession.create(await readFile(path), { executionProviders: ["wasm"] })
-        : await runtime.InferenceSession.create(path, { executionProviders: ["cuda"] });
+        : await runtime.InferenceSession.create(path, gpuSessionOptions());
       return { runtime, tokenizer, session };
     } catch (cause) {
       throw new Error(device === "cuda"
-        ? `CUDA initialization failed for ${preset.model}. Install ONNX Runtime Node with the CUDA provider in ${this.#directory}. CPU was not selected automatically. ${String(cause)}`
+        ? useDirectML
+          ? `DirectML initialization failed for ${preset.model}. CPU was not selected automatically. ${String(cause)}`
+          : `CUDA initialization failed for ${preset.model}. Install ONNX Runtime Node with the CUDA provider in ${this.#directory}. CPU was not selected automatically. ${String(cause)}`
         : `Could not load ${preset.model} on CPU: ${String(cause)}`, { cause });
     }
   }

@@ -116,21 +116,23 @@ test("independent clients share one loaded CPU model, including switches and wor
   await assertSocketAbsent(profile);
 });
 
-test("clients share the CUDA runtime and release its model before loading another device", async (t) => {
-  const profile = await mkdtemp(join(tmpdir(), "smart-mem-worker-cuda-"));
+test("clients share the GPU runtime and release its model before loading another device", async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "smart-mem-worker-gpu-"));
   t.after(() => rm(profile, { recursive: true, force: true }));
   await cacheModel(profile, mini);
-  const runtime = join(profile, "node_modules", "onnxruntime-node");
-  const log = join(profile, "cuda-events");
+  const directml = process.platform === "win32";
+  const runtime = join(profile, ...(directml ? ["directml-1.31.1"] : []), "node_modules", "onnxruntime-node");
+  const log = join(profile, "gpu-events");
   await mkdir(runtime, { recursive: true });
   await writeFile(join(runtime, "index.js"), `
     const {appendFileSync} = require("node:fs");
     const event = (kind) => appendFileSync(${JSON.stringify(log)}, kind + " " + process.pid + "\\n");
     exports.Tensor = class { constructor(type, data, dims) { Object.assign(this, {type, data, dims}); } };
     exports.InferenceSession = {create: async (_path, options) => {
-      if (options.executionProviders[0] !== "cuda") throw new Error("Wrong execution provider");
+      if (options.executionProviders[0] !== ${JSON.stringify(directml ? "dml" : "cuda")}) throw new Error("Wrong execution provider");
+      if (${directml} && (options.enableMemPattern || options.executionMode !== "sequential")) throw new Error("Invalid DirectML session options");
       event("load");
-      console.error("Native CUDA diagnostic fixture");
+      console.error("Native GPU diagnostic fixture");
       return {
         inputNames: ["input_ids"],
         run: async ({input_ids}) => {
@@ -140,7 +142,7 @@ test("clients share the CUDA runtime and release its model before loading anothe
         },
         release: async () => {
           event("release");
-          require("node:fs").writeSync(2, "Native CUDA release diagnostic fixture\\n");
+          require("node:fs").writeSync(2, "Native GPU release diagnostic fixture\\n");
         },
       };
     }};`);
@@ -156,8 +158,20 @@ test("clients share the CUDA runtime and release its model before loading anothe
   const diagnostics = (await waitForWorkerExit(profile, 1)).trim().split("\n").map(JSON.parse);
   await assertSocketAbsent(profile);
   const stderr = diagnostics.filter((entry) => entry.event === "worker.output" && entry.stream === "stderr").map(({ message }) => message).join("");
-  assert.match(stderr, /Native CUDA diagnostic fixture/);
-  assert.match(stderr, /Native CUDA release diagnostic fixture/, "Native stderr still drains after the launching Pi exits");
+  assert.match(stderr, /Native GPU diagnostic fixture/);
+  assert.match(stderr, /Native GPU release diagnostic fixture/, "Native stderr still drains after the launching Pi exits");
+});
+
+test("Windows GPU probe does not install the runtime until explicitly requested", { skip: process.platform !== "win32" }, async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "smart-mem-worker-gpu-probe-"));
+  t.after(() => rm(profile, { recursive: true, force: true }));
+  const worker = new SharedEmbeddings(profile);
+  try {
+    const status = await worker.run((session) => session.gpuAvailability());
+    assert.equal(status.needsRuntime, true);
+    assert.match(status.unavailable, /Enable Windows GPU models/);
+    await assert.rejects(stat(join(profile, "directml-1.31.1")), { code: "ENOENT" });
+  } finally { worker.close(); await waitForWorkerExit(profile, 1); }
 });
 
 test("Windows worker pipes are profile-specific and work without a key", { skip: process.platform !== "win32" }, async (t) => {

@@ -5,7 +5,7 @@ import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { DynamicBorder, getSettingsListTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, SettingsList, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { cudaRequirements, embeddingDevice, models, type Device, type ModelPreset } from "./embeddings.ts";
+import { embeddingDevice, embeddingDeviceLabel, gpuRequirements, models, type Device, type GpuAvailability, type ModelPreset } from "./embeddings.ts";
 import { withFileLock } from "./file-lock.ts";
 import type { Diagnostics } from "./diagnostics.ts";
 import type { Pin } from "./archive.ts";
@@ -105,31 +105,35 @@ const counts = [
   ["Automatic linking (pending memories)", "linkThreshold"],
 ] as const;
 
-export async function chooseEmbeddingModel(ctx: ExtensionContext, current: ModelPreset | undefined, unavailable: string | undefined) {
+export const enableWindowsGpu = "Enable Windows GPU models";
+type ModelSelection = ModelPreset | typeof enableWindowsGpu | undefined;
+
+export async function chooseEmbeddingModel(ctx: ExtensionContext, current: ModelPreset | undefined, { unavailable, needsRuntime }: GpuAvailability): Promise<ModelSelection> {
   const title = current ? "Smart Mem embedding model" : "Set up Smart Mem: select an embedding model";
-  const choices = models.map((preset) => ({
-    preset, value: preset.model, label: preset.model,
+  const choices: { selection: ModelSelection; value: string; label: string; description?: string; disabled?: boolean }[] = models.map((preset) => ({
+    selection: preset, value: preset.model, label: preset.model,
     description: `${preset.tier === "cpu" ? "CPU" : "GPU"} · ${preset.size} · ${preset.dimensions}d${current?.model === preset.model ? " (active)" : ""}`,
     disabled: unavailable !== undefined && preset.tier === "cuda",
   }));
-  const footer = unavailable === undefined ? undefined : `${cudaRequirements}\n${unavailable.replace(/\s+/g, " ")}`;
-  const exit = { value: "", label: "Exit" };
+  if (needsRuntime) choices.push({ selection: enableWindowsGpu, value: enableWindowsGpu, label: enableWindowsGpu, description: "Download ONNX Runtime Node" });
+  choices.push({ selection: undefined, value: "", label: "Exit" });
+  const footer = unavailable === undefined ? undefined : `${gpuRequirements}\n${unavailable.replace(/\s+/g, " ")}`;
   if (ctx.mode !== "tui") {
-    const labels = choices.map(({ label, description, disabled }) => `${label} · ${description}${disabled ? " (unavailable)" : ""}`);
-    const options = [...labels, exit.label, ...(footer ? [footer.replace("\n", " ")] : [])];
+    const labels = choices.map(({ label, description, disabled }) => `${label}${description ? ` · ${description}` : ""}${disabled ? " (unavailable)" : ""}`);
+    const options = [...labels, ...(footer ? [footer.replace("\n", " ")] : [])];
     for (;;) {
       const selected = await ctx.ui.select(title, options);
-      if (selected === undefined || selected === exit.label) return undefined;
+      if (selected === undefined) return undefined;
       const choice = choices[labels.indexOf(selected)];
-      if (choice && !choice.disabled) return choice.preset;
+      if (choice && !choice.disabled) return choice.selection;
       if (footer) ctx.ui.notify(footer, "warning");
     }
   }
   const disabled = new Set(choices.filter((choice) => choice.disabled).map((choice) => choice.value));
-  return ctx.ui.custom<ModelPreset | undefined>((tui, theme, _keys, done) => {
+  return ctx.ui.custom<ModelSelection>((tui, theme, _keys, done) => {
     const accent = (text: string) => theme.fg("accent", text);
     const muted = (text: string) => theme.fg("muted", text);
-    const list = new SelectList([...choices, exit], choices.length + 1, {
+    const list = new SelectList(choices, choices.length, {
       selectedPrefix: accent, selectedText: accent, description: muted, scrollInfo: muted, noMatch: muted,
     }, {
       minPrimaryColumnWidth: 30, maxPrimaryColumnWidth: 53,
@@ -139,7 +143,7 @@ export async function chooseEmbeddingModel(ctx: ExtensionContext, current: Model
       },
     });
     list.onSelect = ({ value }) => {
-      if (!disabled.has(value)) done(choices.find((choice) => choice.value === value)?.preset);
+      if (!disabled.has(value)) done(choices.find((choice) => choice.value === value)?.selection);
     };
     list.onCancel = () => done(undefined);
     const panel = new Container();
@@ -165,7 +169,7 @@ export type SettingsActions = {
 
 async function settingsMenu(ctx: ExtensionContext, settings: Settings, modelName: string, databaseAccess: DatabaseAccessMode) {
   const labels = [
-    ["Embedding model", modelName], ["Embedding device", settings.device.toUpperCase()],
+    ["Embedding model", modelName], ["Embedding device", embeddingDeviceLabel(settings.device)],
     ["Review model", settings.reviewModel ? `${settings.reviewModel.provider}/${settings.reviewModel.id}` : "Inherit"],
     ["Review reasoning", settings.reviewReasoning ?? "Inherit"], ["Review tools", `${settings.reviewTools.length} enabled`],
     ["Trigger phrases", "Edit"], ["Thresholds", "Edit"], ["Automatic linking", settings.autoLink ? "On" : "Off"],
@@ -206,11 +210,12 @@ export async function openSettings(ctx: ExtensionContext, file: SettingsFile, re
         break;
       case 1: {
         if (model?.tier === "cuda") {
-          ctx.ui.notify("This model requires CUDA. Choose a CPU model under Embedding model to switch to CPU.", "info");
+          ctx.ui.notify(`This model requires ${embeddingDeviceLabel("cuda")}. Choose a CPU model under Embedding model to switch to CPU.`, "info");
           break;
         }
-        const next = await ctx.ui.select("Embedding device", ["cpu", "cuda"]);
-        if (next === "cpu" || next === "cuda") await actions.device(next);
+        const gpu = process.platform === "win32" ? "DirectML" : "cuda";
+        const next = await ctx.ui.select("Embedding device", ["cpu", gpu]);
+        if (next === "cpu" || next === gpu) await actions.device(next === "cpu" ? "cpu" : "cuda");
         break;
       }
       case 2: {

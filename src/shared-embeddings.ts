@@ -4,7 +4,7 @@ import { createConnection, type Socket } from "node:net";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import type { Device, ModelPreset, Progress } from "./embeddings.ts";
+import type { Device, GpuAvailability, ModelPreset, Progress } from "./embeddings.ts";
 import type { Embedding } from "./memory-store.ts";
 import { openWorkerEndpoint } from "./embedding-endpoint.ts";
 import type { Reply, Request } from "./embedding-protocol.ts";
@@ -12,7 +12,7 @@ import { withFileLock } from "./file-lock.ts";
 import type { Diagnostics } from "./diagnostics.ts";
 
 type EmbeddingSession = {
-  cudaUnavailable(): Promise<string | undefined>;
+  gpuAvailability(download?: Progress): Promise<GpuAvailability>;
   embed(preset: ModelPreset, device: Device, text: string, options?: { query?: boolean; download?: Progress }): Promise<Embedding>;
 };
 
@@ -118,10 +118,10 @@ export class SharedEmbeddings {
     const directory = join(this.#profile, "embedding-worker");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     return withFileLock(join(directory, "requests.lock"), () => action({
-      cudaUnavailable: async () => {
-        const answer = await this.#call(directory, { kind: "probe" }, signal);
+      gpuAvailability: async (download) => {
+        const answer = await this.#call(directory, { kind: "probe", download: download ? true : undefined }, signal, download);
         if (answer.kind !== "probe") throw new Error("Unexpected embedding worker probe reply");
-        return answer.unavailable;
+        return { unavailable: answer.unavailable, needsRuntime: answer.needsRuntime };
       },
       embed: async (preset, device, text, options = {}) => {
         const answer = await this.#call(directory, { kind: "embed", model: preset.model, device, text,

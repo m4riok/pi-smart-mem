@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { embeddingDevice, models } from "../src/embeddings.ts";
-import { chooseEmbeddingModel, SettingsFile } from "../src/settings.ts";
+import { chooseEmbeddingModel, enableWindowsGpu, SettingsFile } from "../src/settings.ts";
 
 function picker(unavailable) {
   let panel;
@@ -23,8 +23,8 @@ function picker(unavailable) {
 const down = "\x1b[B";
 const confirm = "\r";
 
-test("setup picker shows but disables every GPU model without CUDA, with setup guidance below Exit", async () => {
-  const ui = picker("Unable to load CUDA provider");
+test("setup picker shows but disables GPU models until the provider is available", async () => {
+  const ui = picker({ unavailable: "Fixture GPU provider unavailable" });
   assert.match(stripTerminalSequences(ui.panel.render(110).join("\n")), /all-MiniLM-L6-v2.*CPU/);
   for (const model of models) {
     const rendered = ui.panel.render(110).join("\n");
@@ -36,18 +36,32 @@ test("setup picker shows but disables every GPU model without CUDA, with setup g
     }
     ui.panel.handleInput(down);
   }
-  assert.match(stripTerminalSequences(ui.panel.render(110).join("\n")), /Exit[\s\S]*install CUDA 12 \+ cuDNN 9 and ONNX Runtime Node/);
+  const guidance = stripTerminalSequences(ui.panel.render(110).join("\n"));
+  assert.match(guidance, /Exit[\s\S]*Fixture GPU provider unavailable/);
+  assert.match(guidance, process.platform === "win32" ? /DirectX 12/ : /install CUDA 12 \+ cuDNN 9 and ONNX Runtime Node/);
   ui.panel.handleInput(confirm);
   assert.equal(await ui.result, undefined);
 });
 
-test("setup picker permits explicit GPU selection when CUDA is ready and keeps CPU as the default", async () => {
-  const cpu = picker(undefined);
+test("missing DirectML runtime offers a separate download without changing the CPU default", async () => {
+  const availability = { needsRuntime: true, unavailable: "DirectML not installed" };
+  const cpu = picker(availability);
+  cpu.panel.handleInput(confirm);
+  assert.equal(await cpu.result, models[0]);
+
+  const enable = picker(availability);
+  for (const _model of models) enable.panel.handleInput(down);
+  enable.panel.handleInput(confirm);
+  assert.equal(await enable.result, enableWindowsGpu);
+});
+
+test("setup picker permits explicit GPU selection when ready and keeps CPU as the default", async () => {
+  const cpu = picker({});
   cpu.panel.handleInput(confirm);
   assert.equal(await cpu.result, models[0]);
   assert.equal(embeddingDevice(await cpu.result, "cpu"), "cpu");
 
-  const gpu = picker(undefined);
+  const gpu = picker({});
   const firstGpu = models.findIndex(({ tier }) => tier === "cuda");
   for (let i = 0; i < firstGpu; i++) gpu.panel.handleInput(down);
   assert.doesNotMatch(stripTerminalSequences(gpu.panel.render(110).join("\n")), /To enable GPU embeddings/);

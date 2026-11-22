@@ -4,7 +4,7 @@ import { convertToLlm, getAgentDir, type ExtensionAPI, type ExtensionCommandCont
 import type { Message } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { Archive, contentText } from "./src/archive.ts";
-import { embeddingDevice, models, type Device, type ModelPreset, type Progress } from "./src/embeddings.ts";
+import { embeddingDevice, embeddingDeviceLabel, models, type Device, type ModelPreset, type Progress } from "./src/embeddings.ts";
 import { migrateHermes } from "./src/hermes-migration.ts";
 import { readHermesSource } from "./src/hermes-source.ts";
 import { consolidateMemories, type MaintenanceResult } from "./src/maintenance.ts";
@@ -22,7 +22,7 @@ import { lookupNames, memoryTools, operation, registerTools, sessionSearchTool, 
 import { resolveProject } from "./src/project.ts";
 import { detectTrigger, injectionText, newReport, reviewTask, reviewTitle, runModel, type ModelContext, type RunReport, type Trigger, type UserTrigger } from "./src/review.ts";
 import { reviewEvidence } from "./src/review-evidence.ts";
-import { chooseEmbeddingModel, openSettings, prompt, SettingsFile, type Settings } from "./src/settings.ts";
+import { chooseEmbeddingModel, enableWindowsGpu, openSettings, prompt, SettingsFile, type Settings } from "./src/settings.ts";
 import { SharedEmbeddings } from "./src/shared-embeddings.ts";
 
 const injectedType = "smart-mem-injection";
@@ -215,8 +215,14 @@ export default function smartMemory(pi: ExtensionAPI): void {
   }
 
   async function prepareSetup(ctx: ExtensionContext, current: ModelPreset | undefined, signal: AbortSignal) {
-    const next = await chooseEmbeddingModel(ctx, current, await embeddings.run((worker) => worker.cudaUnavailable(), signal));
-    if (!next) return;
+    const availability = await embeddings.run((worker) => worker.gpuAvailability(), signal);
+    let next = await chooseEmbeddingModel(ctx, current, availability);
+    if (next === enableWindowsGpu) {
+      const checked = await progress(ctx, "Enabling Windows GPU models", (report) =>
+        embeddings.run((worker) => worker.gpuAvailability(report), signal));
+      next = await chooseEmbeddingModel(ctx, current, checked);
+    }
+    if (!next || next === enableWindowsGpu) return;
     const rebuild = !!current && current.model !== next.model;
     const confirm = rebuild
       ? "Existing embeddings will be regenerated. Coordinate other Pi sessions before continuing. The old model stays active if the rebuild fails."
@@ -244,7 +250,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
       activePreset = next;
       panel.setActive(true);
       await refreshCounts(ctx);
-      if (!signal.aborted) notify(ctx, `Smart Mem ready: ${next.model} on ${device.toUpperCase()}`);
+      if (!signal.aborted) notify(ctx, `Smart Mem ready: ${next.model} on ${embeddingDeviceLabel(device)}`);
     }, signal);
     return { title, run };
   }
@@ -262,10 +268,10 @@ export default function smartMemory(pi: ExtensionAPI): void {
       if ((await file.read()).device === device) return;
       const model = await openActivePreset(ctx);
       if (!model) throw new Error("Set up Smart Mem before changing device");
-      await progress(ctx, `Testing ${device.toUpperCase()}`, async () => {
+      await progress(ctx, `Testing ${embeddingDeviceLabel(device)}`, async () => {
         await worker.embed(model, device, "Test embedding device");
         await file.update({ device });
-        if (hasPanel(ctx)) panel.notice(`Embedding device set to ${device.toUpperCase()}`);
+        if (hasPanel(ctx)) panel.notice(`Embedding device set to ${embeddingDeviceLabel(device)}`);
       });
     });
   }
