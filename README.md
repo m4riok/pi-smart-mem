@@ -1,108 +1,259 @@
-# Pi Smart Mem
+![Pi Smart Mem](./pi-smart-mem.png)
 
-**Pick up where you left off without explaining everything again.**
+<div align="center">
 
-Pi Smart Mem gives [Pi](https://pi.dev/) a memory across sessions. It helps Pi remember how you like to work, what your project expects, and what didn't work last time.
+# 🧠 Pi Smart Mem
 
-Smart Mem tools use the `psm_` prefix (for example, `psm_memory_search` and `psm_session_search`) so they can load alongside Hermes without tool name collisions. The two extensions keep separate stores and may each run their own automatic reviews. If you named Smart Mem tools in custom prompts or Pi tool allowlists, update those names to include `psm_`.
+**Persistent memory · Hybrid search · Session history**
 
-## What Pi remembers and where
+</div>
 
-| Kind | Meaning |
+---
+
+Pick up where you left off in [Pi](https://pi.dev/) without explaining everything again. Smart Mem helps Pi remember how you work, what your project expects, and what didn't work last time.
+
+- 🧠 **Memory across sessions** — Keep guidelines, preferences, and notes. Save them for one project or make them available across projects.
+
+- 🔎 **Hybrid memory search** — Find exact error messages and identifiers with keyword search, or find the same idea in different words with local embeddings.
+
+- 💬 **Search past conversations** — Look up what you discussed last week, even if it was never saved as a memory.
+
+- 🔗 **Related memories** — Follow links between useful context that a search might not return together.
+
+- ⚡ **Background review** — Pi reviews conversations for durable decisions, corrections, and lessons while you keep working.
+
+- 📌 **Pins and reusable skills** — Keep standing instructions in view and save procedures you can use again.
+
+- 🧹 **Memory maintenance** — Merge overlapping notes, resolve conflicts, and review how memories are classified.
+
+- 💻 **Local storage and embeddings** — Keep the database and search on your machine. Embeddings run on CPU or compatible NVIDIA GPUs.
+
+## What Smart Mem adds
+
+- **Find by keyword, meaning, or relationship.** Embedded SurrealDB powers hybrid search and a memory graph. Keyword search finds exact terms, local embeddings find the same idea in different words, and graph links connect useful context even when the notes aren't similar. An OAuth note can link to how the tokens are encrypted.
+
+- **Keep memories clean.** Smart Mem checks what's already saved before adding a memory. It can merge overlapping notes and clean up contradictions, so old and conflicting advice doesn't pile up.
+
+- **Reinforce instead of duplicating.** When a fresh correction or verified recurrence confirms a lesson that's already saved, Smart Mem increases that memory's weight instead of adding another copy.
+
+## Quick start
+
+> <br>
+>
+> **Requirements:** Pi 1.5.2 or later and Node.js 22.19 or later.
+>
+> - **Linux / WSL:** `flock` from `util-linux` must be on your `PATH`.
+> - **Windows:** No separate locking utility is required; the npm package installs the native dependency.
+> - **macOS:** No separate locking utility is required; the npm package installs the native dependency.
+>
+> **Platform testing:** Tested on Linux and Windows. macOS is expected to work but hasn't been tested.
+>
+> <br>
+
+<br>
+
+1. Install Smart Mem from npm:
+
+   ```sh
+   pi install npm:pi-smart-mem
+   ```
+
+2. Start Pi (or run `/reload` if it's already open), then run `/psm-setup`.
+
+3. Choose a CPU embedding model and confirm the download. The default MiniLM model is about 23 MB.
+
+   **CPU setup needs no GPU, CUDA, or extra runtime installation.**
+
+4. Once setup finishes, try asking Pi to remember a project convention or to find something you discussed in a past session.
+
+   To make older Pi sessions searchable, use `/psm-settings` → **Transcript index** → **Backfill Pi sessions**.
+
+### Optional: NVIDIA GPU embeddings
+
+For GPU embeddings, set up an NVIDIA driver, CUDA 12, and cuDNN 9 for your OS. Make sure Smart Mem can load `onnxruntime-node` with the CUDA execution provider. It doesn't need to be installed in the Smart Mem profile.
+
+Then run `/psm-setup` and choose a GPU embedding model. If you've already set up Smart Mem, use `/psm-settings` → **Embedding model** to switch.
+
+> <div align="center">
+>
+> <br>
+>
+> **Migrating from Hermes?**
+>
+> Use `/psm-migrate-hermes` to import your data from `pi-hermes-memory`.
+>
+> <br>
+>
+> </div>
+
+## Features
+
+| Feature | What it does |
 | --- | --- |
-| **Guideline** | Clear owner-given standing direction. |
-| **Preference** | A preferred default, not a requirement. |
-| **Note** | Other durable facts, decisions, and lessons. |
+| 🧠 **Persistent memory** | Keep guidelines, preferences, and lessons across sessions. Save them for one project or make them available across projects. |
+| 🔎 **Hybrid search** | Find memories by exact terms or by meaning, even when you don't remember the original wording. |
+| 🎯 **Context-aware recall** | Automatically brings relevant memories into the current conversation without loading everything you've saved. Use `/psm-inject` to bring in relevant context on demand. |
+| 🔗 **Memory links** | Connect notes that are useful together, even when they aren't similar enough to show up in the same search. |
+| 💬 **Session search** | Find details in past Pi conversations that were never saved as memories. |
+| ⚡ **Background review** | Decides what's worth remembering, whether to add a new memory, update or reinforce an existing one, or skip it. For new memories, it chooses the kind and whether they belong to the project or should be available globally. |
+| ⚙️ **Configurable reviews** | Choose which model reviews your conversations, how often it runs, and what instructions it follows when deciding what to save. |
+| ⚖️ **Weighted memories** | Reinforce an existing memory when a fresh correction or verified recurrence confirms it, instead of saving another copy. |
+| 🧹 **Consolidation** | Merge overlapping memories so the same advice doesn't live in several places. |
+| 🧩 **Conflict cleanup** | Find and clean up contradictions between memories or with standing instructions. |
+| 🧭 **Memory respects your instructions** | Saved memories provide context, not authority. Your current request and applicable project instructions take precedence. |
+| 📌 **Pins** | Keep standing instructions available without relying on search to find them. |
+| 📚 **Reusable skills** | Pi can decide on its own to save a useful procedure as a skill so it can reuse what worked next time. |
 
-Each kind can be project-scoped or global. Existing Smart Mem databases from the earlier category schema are not migrated.
+## Make memory work your way
 
-Project notes stay with their project. Global notes are available across projects. Memories are short, durable notes, not copies of chats or large blocks of code. Your current request and standing guidance take precedence. When a project note conflicts with a global default, the project note takes precedence in that project.
+Smart Mem ships with default prompts, but you're not locked into them. In `/psm-settings` → **Model prompts**, you can change what Pi considers worth saving, how it classifies and reinforces memories, what it brings back into a conversation, and how it links, merges, or cleans up notes.
 
-## How hybrid search finds notes
+For example, you can ask Pi to save fewer routine details and focus on decisions, recurring mistakes, and project conventions. Edit the prompts that matter to you and leave the rest as-is. You can restore the defaults at any time.
 
-Search combines **keyword ranking (BM25)** with **semantic ranking (local embeddings)**. Keywords help find distinctive terms in errors and identifiers; embeddings help find the same idea in different words. For example, searching for "JWT lifetime" can surface a note about "token expiry". Smart Mem combines both rankings into one list.
+In `/psm-settings` → **Trigger phrases**, you can also add correction phrases that start a background review or exclude phrases you don't want to trigger it. A phrase starts a review; it doesn't automatically save a memory.
 
-Pi searches the current project and global notes by default. It can narrow search by scope or memory type, and results are labeled **Project** or **Global**. Other projects' memories are excluded. Pi can also follow saved links one step at a time to find a related note that neither search ranked highly. Links can lead from project notes to global notes, but not the reverse or into another project.
+## How it works
 
-## When Pi saves memories
+### Memory retrieval
 
-Pi can save a note during normal work. Say **"remember this"** to ask it to consider saving something; that request does not guarantee a new entry. Before saving, the model is prompted to check standing guidance and search for similar notes **in the same scope**. It should skip what's already covered, update a note when the rule changes, or add a genuinely distinct note. This is model judgment, not a guarantee against duplicates. A review can increase an existing memory's weight by one when original session evidence confirms a new correction or recurrence, including an independently verified finding. The reviewer cites the original message, so echoes do not invalidate its evidence. The same evidence message counts once. Identical wording can count again if the reviewer identifies a separate mistake or verified recurrence, not if it merely restates a rule or repeats an earlier incident. A rejected evidence citation is a skip, not a review failure. Positive weight indicates a recurring issue or situation; zero means no reinforcement was recorded. When retrieving or selecting notes for injection, the model is guided to prefer higher weight only between similarly relevant, applicable notes. Weight does not change search ranking.
+**Automatic recall starts after 10 conversation messages by default**, counting both user and assistant messages. Change that number in `/psm-settings` → **Thresholds** → **Initial injection (messages)**. Pi uses the conversation so far to decide what to search for and adds only the memories it finds relevant. If none apply, it adds nothing. Use `/psm-inject` to run the same selection on demand.
 
-Automatic memory review runs in the main Pi session:
+**Search combines keywords and embeddings.** Smart Mem searches by both exact terms and meaning, then combines the results into one ranked list. By default it searches the current project's memories and global memories, not other projects' memories.
 
-| Trigger | Default behavior |
-| --- | --- |
-| **Explicit save request or recognized correction** | Queue after the foreground run finishes, so the reviewer can see confirmed writes. |
-| **Periodic review** | After a non-aborted run, if at least 10 turns or 15 assistant tool calls have accumulated and there are at least 3 user messages and 4 usable context messages. |
-| **Before compaction** | Queue a review if the conversation has at least 6 user messages. Compaction does not wait. Once this review starts, it has 60 seconds by default. |
+**Results include memory weights.** Pi is instructed to prefer higher weight when two memories are similarly relevant and applicable. A high weight doesn't make an unrelated memory relevant or override current instructions.
 
-Reviews, manual injection, interactive maintenance, background setup and import, and automatic linking share one sequential background queue per session. The Memory panel shows running and queued work. Exit or reload cancels unfinished jobs without starting a final review. Changes already saved stay saved. Foreground memory tools still return their actual results.
+**Related memories are one hop away.** A stored graph link isn't the same as vector similarity. When Pi finds a useful memory, it can follow that memory's links to find related notes that didn't rank in the search. The link lookup returns directly connected memories; neither search nor automatic recall adds those neighbors by default. Pi has to look them up and decide which ones are useful.
 
-Use **Alt+U** in the Memory panel to see the latest review's decisions and tool details.
+#### Example search
 
-## Model calls and token usage
+```mermaid
+flowchart LR
+    Q["Search: What happens when an OAuth token expires?"]
+    A["Result 1 · weight 3<br/>Refresh the access token before its TTL runs out."]
+    B["Result 2 · weight 1<br/>If OAuth refresh fails, ask the user to sign in again."]
+    C["Linked memory · weight 2<br/>Encrypt the stored refresh token with the OS keychain."]
 
-**Searching and embedding notes run locally without a separate chat-model call. Reviewing, selecting, and maintaining memories can use extra tokens.** Reviews call your configured Pi model even when nothing is saved. A review can take multiple calls as the model searches and decides what to write. If you use a hosted model, conversation context and retrieved text can be sent to that provider. These calls count toward provider usage and may cost money.
-
-Other features that make model calls:
-
-- **Memory injection:** Pi selects relevant notes once after 10 total user and assistant messages by default. It selects again after compaction if it previously injected notes. If search hits leave a gap, the selector can follow stored memory links for complementary context. `/psm-inject` queues selection on demand. Interactive chat can continue while it runs. If the model finishes normally without choosing any notes, nothing is injected and no error is shown. Injected notes become part of the conversation and can increase input tokens on later turns.
-- **Maintenance:** `/psm-link` asks the model to find useful relationships across all eligible memory pairs, not just vector neighbors. `/psm-consolidate` asks it which notes to merge or shorten. Rewrites without a merge must save at least 30 characters and 5% of the original, or the note stays unchanged. Automatic linking is off by default; if enabled, its default threshold is 10 pending notes in one scope.
-
-Open `/psm-settings` to adjust thresholds and triggers. Reviews inherit the session model and reasoning level unless you choose separate settings.
-
-**Advanced database access:** `/psm-settings` → **Database access (this session)** exposes `psm_db_query` to the foreground model without a reload. Start **Disabled**; choose **Read-only** to inspect Smart Mem data across projects or **Read-write** to edit existing data. No mode permits model queries to change schema or create tables. The mode resets on reload or when starting another session. Raw writes bypass Smart Mem's normal embedding, check-marker, and link maintenance; use regular memory tools when they can do the job. `smart-mem.log` records mode changes, query starts and finishes, and outcomes without SQL or result content. With **Debug logging** on, it also records full SQL, results, and errors. Raw query calls and results can appear in the Pi session transcript regardless of the debug setting.
-
-## Set it up and make it yours
-
-Requirements: Pi 1.5.2 or later, Node.js 22.19 or later, and Linux or WSL with `flock`. Git is optional; it enables origin and worktree detection.
-
-If Smart Mem isn't set up, Pi shows a warning at startup. Run `/psm-setup` when you're ready. The picker shows 7 CPU models and 6 GPU models with download sizes and embedding dimensions. The CPU default is English-focused MiniLM (about 23 MB). The catalog also includes smaller paraphrase models, multilingual E5 and BGE models, and GPU options for code and longer text. Model files download only after you confirm. In interactive Pi, first-time download and initialization continue in the background; the Memory panel shows progress. Rebuilding an existing index stays in the foreground. Embedding generation, indexing, and storage stay on your machine.
-
-Smart Mem checks whether ONNX Runtime can actually run an operation on CUDA. If the GPU, CUDA libraries, or ONNX Runtime CUDA provider aren't usable, GPU choices stay visible but disabled; see the note below **Exit**. No GPU or extra runtime is needed for CPU setup.
-
-Pi sessions and subagents using the same Smart Mem profile share one local embedding worker on CPU or CUDA. The first embedding request or setup probe starts it; Pi startup alone doesn't. The worker unloads the current model before loading another and exits after the last connected client disconnects.
-
-Open `/psm-settings` to change models, review thresholds, triggers, tools, and prompts. Changing the embedding model rebuilds the index; close or coordinate other Pi sessions before doing this.
-
-### Enable GPU embeddings
-
-Install a compatible NVIDIA driver, CUDA 12 runtime libraries and cuDNN 9, then install ONNX Runtime Node with its CUDA provider in your Smart Mem profile. This Linux x64/WSL runtime version was tested with CUDA 12:
-
-```sh
-profile="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/pi-smart-mem"
-mkdir -p "$profile"
-npm install --prefix "$profile" --ignore-scripts onnxruntime-node@1.23.2
-node "$profile/node_modules/onnxruntime-node/script/install.js" --onnxruntime-node-install=cuda12
+    Q -->|"Similar meaning via embeddings"| A
+    Q -->|"Shared terms: OAuth, token"| B
+    A -.->|"Follow stored link"| C
 ```
 
-Run `/psm-setup` or choose **Embedding model** in `/psm-settings` to check again. Selecting a GPU model explicitly chooses CUDA; detection alone changes nothing. For CPU-capable models, use **Embedding device** if you want to opt into CUDA. Smart Mem never installs NVIDIA libraries or falls back to CPU when CUDA was selected.
+Search returns results 1 and 2. If Pi follows the stored link from result 1, it also finds the note about encrypting the refresh token.
 
-## Migrate from pi-hermes-memory
+#### Pins: instructions that don't need retrieval
 
-Close other Pi sessions using Hermes or Smart Mem, then run `/psm-migrate-hermes` in a main Pi session. One run imports global and project memories, skills, and pins. `MEMORY.md` entries and failures import as notes; `USER.md` entries import as global preferences. Failures with a saved project tag stay project-scoped; untagged failures stay global. When available, Hermes creation dates initialize Smart Mem's revision timestamp. Project folders are matched automatically; the command reports IDs for imported projects it could not match. Hermes files stay unchanged. In interactive Pi, normal import runs in the background after any setup dialogs, with progress in the Memory panel. Leaving the session cancels work that has not reached the replacement transaction. The panel keeps the import result for 60 seconds. Unmatched project IDs remain available in `smart-mem.log`.
+Pins are standing instructions you want Pi to see every time. Smart Mem adds all applicable pins to Pi's system prompt at the start of each run. They don't depend on search or the automatic recall threshold.
 
-`/psm-migrate-hermes force` runs in the foreground and **replaces existing Smart Mem data**, including memories, links, skills, pins, and the transcript index. Without `force`, migration refuses to replace a populated store. Neither form deletes Pi transcripts.
+Use `/psm-pin <text>` for the current project, or `/psm-pin global <text>` to make the instruction available across projects. To remove a pin, open `/psm-settings` → **Pins**.
 
-After importing, run `/psm-reclassify` once in each imported project you want to review; append `global` on one run to include global memories. New saves already get a kind, so there is no need to run this routinely. If the original conversations are in Pi but not indexed yet, run `/psm-settings` → **Transcript index** → **Backfill Pi sessions** before reclassifying. Hermes import does not import transcripts.
+### How memories are saved
 
-## Database upgrades
+The **main agent** can save a memory directly during normal work. You don't have to ask it to remember something. Smart Mem also runs **background reviews** to catch useful information the main agent didn't save.
 
-Smart Mem upgrades an existing database when Pi starts, using a versioned schema under the database lock. It reports progress and outcomes in the status panel and `smart-mem.log`. Fresh setup creates the current schema directly. The consolidation upgrade preserves existing notes, embeddings, and any previous check markers; no Hermes re-import is needed. If an upgrade fails or the database version is newer than supported, Smart Mem stays unavailable and reports the error.
+#### When a background review runs
 
-## Project identity
+- **When you correct Pi or ask it to remember something.** A recognized correction or a request such as "remember this" queues a review after the current run finishes.
+- **Periodically.** By default, a review is due after **10 turns or 15 tool calls**, whichever comes first, once there's enough conversation to review.
+- **Before compaction.** If the conversation has at least six user messages, Smart Mem captures the conversation before Pi shortens it. The review uses that captured context in the background while compaction proceeds, and can finish afterward.
 
-Smart Mem looks up Git `origin` locally and uses `.pi/smart-mem-id` when the origin is missing or new. It creates the marker in the main checkout, or in the working folder outside Git. Keep the marker when moving or renaming a project. Worktrees, clones with the same origin, and copies carrying the same marker share memories, skills, and pins within the same Smart Mem database. If origin and marker point to different known projects, Smart Mem reports the conflict and leaves both unchanged.
+In `/psm-settings`, use **Trigger phrases** to adjust which corrections start a review and **Thresholds** to change the periodic intervals and the pre-compaction review timeout. You can also choose a **Review model** or let reviews use the current session's model, and edit the review guidance under **Model prompts**.
 
-## Keep, find, and clean up information
+#### How a review decides what to save
 
-The **🧠** panel stays above the editor. Its status bar animates while Smart Mem is working. The panel shows whether Smart Mem is active, separate Project and Global counts for memories, skills, and pins, plus running work and the latest result or error. Counts update at startup and after writes in this session. Informational results clear after five seconds by default; warnings and errors do not expire automatically. Press **Alt+U** to expand or hide available details. Automatic review entries stay in session history but appear only in the panel. Foreground Smart Mem calls show a compact argument preview and a muted result summary. Use Pi's tool expansion (Ctrl+O by default) to see the full arguments and result.
+A trigger starts a review, not a save. The reviewer decides whether the information will be useful in later sessions, chooses the appropriate scope, and searches that scope before writing anything:
 
-- `/psm-pin <text>` adds standing instructions for this project. `/psm-pin global <text>` adds them across projects. Under **`/psm-settings` → Pins**, choose **Project** or **Global** to view pins and confirm removal of one. Pins are separate from searchable memories; removing a pin stops it from appearing in future prompts without changing past turns.
-- Ask Pi to save a reusable procedure as a skill. The main model checks for similar skills and decides whether the procedure belongs to this project or applies globally. Automatic memory review does not save skills.
-- Ask Pi to search past conversations for details that were never saved as memories. `psm_session_search` searches across indexed projects by default, excluding the active session. It can filter by the exact Pi working directory (`project`, not a folder name or Git origin) and by message author (`role: "user"` or `"assistant"`). Project-specific searches use a known exact directory; cross-project searches omit it. The **Transcript index** settings let you backfill existing Pi sessions or clear the index without deleting transcripts.
-- `/psm-consolidate` checks new, edited, or previously unchecked project memories. `global` includes global memories, `full` rechecks all project memories, and `global full` rechecks both scopes. In incremental mode, older checked notes still qualify as candidates within the same scope. Existing notes without a check marker are pending on the first run; failed checks stay pending.
-- `/psm-link` checks this project's pending notes; append `global` to also check pending global notes. Use `/psm-link full` to recheck all project notes or `/psm-link global full` to also recheck all global notes. Full runs keep existing links and count only newly saved links. Existing notes are pending on upgrade; later incremental runs check only new or text-edited notes, with checked notes still eligible as targets. Same-scope links work both ways; cross-scope links work only from project to global. A failed batch is retried once. If it still fails, affected pending sources stay pending; a full run does not reset prior checks. In interactive Pi, linking and consolidation run in the background and report in the Memory panel. Leaving the session cancels remaining work without undoing saved links.
-- `/psm-reclassify` is a one-time review after a Hermes import. It checks all memories in the current project in batches; append `global` to include global memories. It uses the same `classification` prompt as new saves (editable under **Model prompts**). Before promoting a memory to `guideline`, it can search indexed past Pi conversations with `psm_session_search` if the note alone doesn't establish a standing rule. A one-off instruction or approval is not enough. If the available evidence doesn't clearly support a different kind, the command keeps the current kind. It leaves text, weight, scope, revision date, and links intact.
-- `/psm-cleanup-conflicts` checks the current project and global memories. It checks all notes against applicable system and `AGENTS.md` guidance first. The memory-to-memory pass checks only pending sources against up to eight similar notes in the same scope, including already-checked targets. On upgrade, existing notes are pending; later, new or text-edited notes and unfinished checks are pending. Project guidance cannot invalidate global memories. Bare `guidance-only` or `memory-only` runs just that pass. Guidance cleanup removes only conflicting content. For memory conflicts, the newer substantive position wins; unrelated details and links survive, and the highest weight is retained. Tied revisions stay unchanged.
-- **Diagnostics:** `~/.pi/agent/pi-smart-mem/smart-mem.log` (under `$PI_CODING_AGENT_DIR` when set) records Smart Mem operations, errors, and native embedding worker output as JSON lines. It rotates at 5 MiB and retains three archives (`.1` newest). `/psm-settings` → **Debug logging** is OFF by default. Turn it ON to trace manual linking, consolidation, reclassification, and both conflict-cleanup passes. Traces include the notes, shortlist or applicable guidance sent for judgment, plus the model reply and tool calls. Linking traces don't copy the conversation into the request log. Linking, reclassification, and conflict cleanup also log successful tool outcomes. These records can contain private memory text or guidance and remain in logs after turning debug OFF. Review logs before sharing.
+- **Add** a new memory if it captures something distinct and worth keeping.
+- **Update** an existing memory if the conversation changes it or adds a lasting detail.
+- **Reinforce** an existing memory if a fresh correction or verified recurrence confirms something already covered. This increases its weight instead of creating a duplicate.
+- **Skip** if there's nothing durable to add or change and no new evidence to reinforce it.
+
+For a new memory, the reviewer picks both a **scope** and a **kind**. Project scope keeps it with the current project; global scope makes it available across projects. A **guideline** is a standing rule you've given Pi, a **preference** is a default you favor, and a **note** captures other durable facts, decisions, or lessons.
+
+### Memory maintenance
+
+Linking connects distinct memories, consolidation combines overlapping ones, and conflict cleanup deals with memories that disagree.
+
+#### Linking
+
+`/psm-link` asks Pi to find memories that are useful together. For example, a note about OAuth token refresh can link to a separate note about how those tokens are stored securely. Pi considers all eligible pairs for the memories being checked, in batches if needed, rather than relying on vector similarity to decide which pairs it sees. Smart Mem saves each connection as a graph link between two memories, not as part of either memory's text. Pi can follow that link from one memory to the other during retrieval.
+
+**Automatic linking** is off by default. Turn it on in `/psm-settings` → **Automatic linking**. Smart Mem then checks for links once a scope has **10 pending memories** by default. Change that number under **Thresholds** → **Automatic linking (pending memories)**.
+
+#### Consolidation
+
+`/psm-consolidate` looks for overlapping memories in the same scope. For each memory it checks, Smart Mem gives Pi up to eight similar notes to compare. Pi can merge notes that cover the same rule or answer the same question, or shorten a note that repeats itself. It keeps distinct details and conditions rather than merging notes just because they're about the same topic.
+
+For example, "Run `npm test` before opening a PR" and "Check types with `npm run check` and run `npm test` before opening a PR" can become one note that keeps both checks.
+
+Linking and consolidation check pending project memories by default. Add `global` to include global memories, `full` to recheck all project memories, or `global full` to recheck both scopes.
+
+#### Conflict cleanup
+
+`/psm-cleanup-conflicts` checks current-project and global memories in two passes:
+
+1. **Against standing instructions.** Pi checks for direct contradictions with applicable instructions, such as an `AGENTS.md` rule. It removes the conflicting part and keeps unrelated information. It deletes a memory only if nothing durable remains.
+2. **Against other memories.** Pi compares pending memories with up to eight similar notes in the same scope. It looks for advice that disagrees under the same conditions, not rules for different situations. When it resolves a conflict, it keeps unrelated details from the affected notes.
+
+Run both passes together, or use `/psm-cleanup-conflicts guidance-only` or `/psm-cleanup-conflicts memory-only` to run just one.
+
+#### Reclassification
+
+`/psm-reclassify` is useful after importing memories from Hermes, which doesn't use Smart Mem's guideline, preference, and note categories. Pi reviews each imported memory's kind and changes it only when the evidence supports a different one. It doesn't rewrite the memory or move it between project and global scope. Run it in each imported project you want to review, and add `global` on one run to include global memories.
+
+#### Direct database access
+
+For a maintenance task the built-in commands don't cover, give Pi direct access to the Smart Mem database through `/psm-settings` → **Database access (this session)**. Choose **Read-only** to inspect data or **Read-write** if the task needs changes. Access is off by default and applies only to the current session.
+
+> <br>
+>
+> **Working with memories**
+>
+> - **Edit or forget a memory directly.** Ask Pi to correct or remove a saved memory without running a maintenance pass.
+> - **Search is local; model calls count toward usage.** Search and embedding generation run on your machine. Background reviews, automatic recall selection, and maintenance can make extra model calls that count toward your provider usage.
+> - **Results depend on the model.** Reviews, classification, linking, consolidation, and conflict cleanup use model judgment. A model can miss an overlap or conflict, or make the wrong call. You can ask Pi to correct the result.
+>
+> <br>
+
+### Reusable skills
+
+A memory tells Pi **what to know**. A skill tells it **how to do something again**: the steps that worked, pitfalls to avoid, and how to verify the result.
+
+Pi can save a skill on its own when it finds a repeatable workflow or you teach it one. Before saving, it looks for an existing skill it can reuse or improve. Skills can be project-specific or global, depending on where the procedure applies.
+
+For example, a memory might say that a stale generated client causes a type error. A skill can capture how to regenerate the client, check the diff, and run the tests that verify the fix. Next time Pi sees that error, it can search for the skill and follow the procedure instead of working it out again.
+
+### Session search
+
+Use session search when you're trying to find something you discussed, not something Pi deliberately saved as a memory. Ask, for example, "What did we decide about the OAuth callback last week?" Pi can search past conversations for matching messages.
+
+Search covers indexed conversations across projects by default and leaves out the current session. Pi can narrow it to a specific project or to messages you wrote.
+
+Smart Mem indexes new conversations during normal use. To include older Pi chats, open `/psm-settings` → **Transcript index** → **Backfill Pi sessions**. You can also clear the search index from that menu without deleting the original transcripts.
+
+## Storage and logs
+
+Smart Mem keeps its files in `~/.pi/agent/pi-smart-mem/` by default. If you set `PI_CODING_AGENT_DIR`, look for `pi-smart-mem/` inside that directory instead.
+
+| Path | What's stored there |
+| --- | --- |
+| `db/` | Embedded SurrealDB database: memories, graph links, pins, skills, and the searchable transcript index. Original Pi transcripts stay in Pi's `sessions/` directory. |
+| `models/` | Downloaded embedding models used for local inference. |
+| `settings.json` | Smart Mem settings, including your prompt overrides. |
+| `smart-mem.log` | Activity, review outcomes, and errors. |
+
+If you're tuning a prompt, turn on `/psm-settings` → **Debug logging** and run the relevant maintenance command again. For manual linking, consolidation, reclassification, and conflict cleanup, the log shows what the model evaluated and how it responded. Read it yourself or ask Pi to assess whether the decisions match what you intended. Debug logs can contain memory text and standing instructions, so review them before sharing.
+
+## Contributing
+
+Small fixes can go straight to a pull request. If your change affects what Smart Mem saves, recalls, or modifies automatically, open an issue first so we can agree on the intended behavior.
+
+1. **Report the problem.** For a bug, include your OS, Pi and Smart Mem versions, what you expected, and steps to reproduce it. Remove private memory text, prompts, and credentials from any logs you share.
+2. **Make and test the change.** Fork the repo and branch from `main`. Use a disposable Pi profile for tests, not your own memory database or session history.
+
+   ```sh
+   npm ci
+   npm run check
+   npm test
+   ```
+
+3. **Open a focused pull request.** Explain what changed, why, and how you tested it. For platform-specific changes, include which OS you tested.

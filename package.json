@@ -1,9 +1,9 @@
 {
-  "name": "@m4riok/pi-smart-mem",
+  "name": "pi-smart-mem",
   "version": "0.0.0",
   "description": "Persistent project and global memory for Pi with local embeddings",
+  "keywords": ["pi-package"],
   "type": "module",
-  "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -22,7 +22,8 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/m4riok/pi-smart-mem/main/pi-smart-mem.png"
   },
   "scripts": {
     "check": "tsc --noEmit",
