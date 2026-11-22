@@ -1,9 +1,9 @@
-import { rm } from "node:fs/promises";
-import { createServer, type Socket } from "node:net";
+import type { Socket } from "node:net";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { LocalEmbeddings, models } from "./embeddings.ts";
-import { openSocketDirectory, parseRequest, type Reply } from "./embedding-protocol.ts";
+import { createWorkerServer, openWorkerEndpoint } from "./embedding-endpoint.ts";
+import { parseRequest, type Reply } from "./embedding-protocol.ts";
 import { withFileLock } from "./file-lock.ts";
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -11,10 +11,15 @@ const send = (socket: Socket, reply: Reply) => { if (!socket.destroyed) socket.w
 
 async function serve(profile: string, directory: string) {
   const local = new LocalEmbeddings(profile);
-  const endpoint = await openSocketDirectory(directory);
+  const endpoint = await openWorkerEndpoint(directory);
+  try { await listen(local, endpoint); }
+  finally { await endpoint.close?.(); }
+}
+
+async function listen(local: LocalEmbeddings, endpoint: Awaited<ReturnType<typeof openWorkerEndpoint>>) {
   let work = Promise.resolve();
   let clients = 0;
-  const server = createServer((socket) => {
+  const server = await createWorkerServer(endpoint, (socket) => {
     clients++;
     const disconnect = new AbortController();
     socket.on("error", () => socket.destroy());
@@ -48,20 +53,16 @@ async function serve(profile: string, directory: string) {
     if (!clients && !process.connected && server.listening) server.close();
   }
   process.once("disconnect", stopWhenUnused);
-  try {
-    // Only the worker holding the lifetime lock may remove a stale socket.
-    await rm(endpoint.path, { force: true });
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.once("close", resolve);
-      server.listen(endpoint.path, () => {
-        if (process.connected) process.send?.({ ready: true }, (error) => { if (error) stopWhenUnused(); });
-        else stopWhenUnused();
-      });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.once("close", resolve);
+    server.listen(endpoint.path, () => {
+      if (process.connected) process.send?.({ ready: true }, (error) => { if (error) stopWhenUnused(); });
+      else stopWhenUnused();
     });
-    await work;
-    await local.close();
-  } finally { await endpoint.close(); }
+  });
+  await work;
+  await local.close();
 }
 
 const profile = process.argv[2];

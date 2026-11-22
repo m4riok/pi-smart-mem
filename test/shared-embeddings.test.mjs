@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { models } from "../src/embeddings.ts";
+import { createWorkerServer, openWorkerEndpoint } from "../src/embedding-endpoint.ts";
 import { SharedEmbeddings } from "../src/shared-embeddings.ts";
 
 const mini = models[0];
@@ -75,14 +77,11 @@ async function waitForWorkerExit(profile, count) {
   assert.fail(`Embedding worker diagnostics did not record shutdown:\n${log}`);
 }
 
-async function waitForSocketToClose(socket) {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    try { await stat(socket); }
-    catch (error) { if (error.code === "ENOENT") return; throw error; }
-    await setTimeout(20);
-  }
-  assert.fail("Embedding worker socket still present after all clients exited");
+async function assertSocketAbsent(profile) {
+  if (process.platform === "win32") return; // Named pipes are not filesystem entries.
+  const endpoint = await openWorkerEndpoint(await realpath(join(profile, "embedding-worker")));
+  try { await assert.rejects(stat(endpoint.path), { code: "ENOENT" }); }
+  finally { await endpoint.close?.(); }
 }
 
 test("independent clients share one loaded CPU model, including switches and worker restart", async (t) => {
@@ -91,9 +90,9 @@ test("independent clients share one loaded CPU model, including switches and wor
   t.after(() => rm(root, { recursive: true, force: true }));
   await cacheModel(profile, mini);
   await cacheModel(profile, bge);
-  const socket = join(profile, "embedding-worker", "worker.sock");
+  await mkdir(join(profile, "embedding-worker"));
   const [first, second, third] = [client(t, profile), client(t, profile), client(t, profile)];
-  await assert.rejects(stat(socket), { code: "ENOENT" });
+  await assertSocketAbsent(profile);
   const loads = await Promise.all([first.embed(mini), second.embed(mini), third.embed(mini)]);
   assert.equal(loads.reduce((sum, count) => sum + count, 0), 1);
   await first.exit();
@@ -103,13 +102,18 @@ test("independent clients share one loaded CPU model, including switches and wor
   assert.equal(await third.embed(mini), 1, "Switching must evict the previous session");
   await second.exit();
   await third.exit();
-  await waitForSocketToClose(socket);
+  await waitForWorkerExit(profile, 1);
+  await assertSocketAbsent(profile);
 
   const restarted = client(t, profile);
   assert.equal(await restarted.embed(mini), 1);
-  await restarted.exit();
-  await waitForSocketToClose(socket);
+  const rows = (await readFile(join(profile, "smart-mem.log"), "utf8")).trim().split("\n").map(JSON.parse);
+  process.kill(rows.findLast(({ event }) => event === "worker.start").workerPid, "SIGKILL");
   await waitForWorkerExit(profile, 2);
+  assert.equal(await restarted.embed(mini), 1, "The same client must reconnect after the worker dies");
+  await restarted.exit();
+  await waitForWorkerExit(profile, 3);
+  await assertSocketAbsent(profile);
 });
 
 test("clients share the CUDA runtime and release its model before loading another device", async (t) => {
@@ -149,11 +153,27 @@ test("clients share the CUDA runtime and release its model before loading anothe
   assert.deepEqual(events.map(([kind]) => kind), ["load", "run", "run", "release"]);
   assert.equal(new Set(events.map(([, pid]) => pid)).size, 1);
   await second.exit();
-  await waitForSocketToClose(join(profile, "embedding-worker", "worker.sock"));
   const diagnostics = (await waitForWorkerExit(profile, 1)).trim().split("\n").map(JSON.parse);
+  await assertSocketAbsent(profile);
   const stderr = diagnostics.filter((entry) => entry.event === "worker.output" && entry.stream === "stderr").map(({ message }) => message).join("");
   assert.match(stderr, /Native CUDA diagnostic fixture/);
   assert.match(stderr, /Native CUDA release diagnostic fixture/, "Native stderr still drains after the launching Pi exits");
+});
+
+test("Windows worker pipes are profile-specific and work without a key", { skip: process.platform !== "win32" }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "psm-pipes-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const endpoint = await openWorkerEndpoint(root);
+  assert.notEqual(endpoint.path, (await openWorkerEndpoint(join(root, "other"))).path);
+  const server = await createWorkerServer(endpoint, (socket) => socket.end("ready"));
+  await once(server.listen(endpoint.path), "listening");
+  try {
+    const socket = createConnection(endpoint.path);
+    const chunks = [];
+    for await (const chunk of socket) chunks.push(chunk);
+    assert.equal(Buffer.concat(chunks).toString(), "ready");
+    await assert.rejects(stat(join(root, "pipe.key")), { code: "ENOENT" });
+  } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
 test("canceling a wait for the shared embedding lock does not run the queued action", async (t) => {

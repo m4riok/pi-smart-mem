@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { createServer } from "node:net";
 import { createInterface } from "node:readline";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
@@ -14,14 +14,14 @@ import { getKeybindings, KeybindingsManager, setKeybindings } from "@earendil-wo
 import { Archive } from "../src/archive.ts";
 import { withDatabase } from "../src/database.ts";
 import { models } from "../src/embeddings.ts";
-import { openSocketDirectory } from "../src/embedding-protocol.ts";
+import { createWorkerServer, openWorkerEndpoint } from "../src/embedding-endpoint.ts";
 import { MemoryStore } from "../src/memory-store.ts";
 import { resolveProject } from "../src/project.ts";
 import { prompts, SettingsFile } from "../src/settings.ts";
 
 const hermesNames = ["memory_add", "memory_replace", "memory_remove", "session_search", "memory_search"];
 
-async function fixture(t, { child = false, setup = false, empty = false, hermes = false, mode = "rpc", setWidget = () => {}, select, custom, confirm = false, fauxModels } = {}) {
+async function fixture(t, { child = false, setup = false, empty = false, hermes = false, mode = "rpc", setWidget = () => {}, select, custom, confirm = false, fauxModels, beforeBind } = {}) {
   const cwd = await mkdtemp(join(tmpdir(), "smart-mem-pi-"));
   const agentDir = join(cwd, "agent");
   const directory = join(agentDir, "pi-smart-mem");
@@ -62,7 +62,7 @@ async function fixture(t, { child = false, setup = false, empty = false, hermes 
   const modelRuntime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null, modelsStorePath: join(agentDir, "models-cache.json"), refreshOnCreate: false });
   modelRuntime.registerNativeProvider(faux.provider);
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 16 } });
-  const additionalExtensionPaths = [new URL("../index.ts", import.meta.url).pathname];
+  const additionalExtensionPaths = [fileURLToPath(new URL("../index.ts", import.meta.url))];
   if (hermes) {
     const path = join(cwd, "hermes-fixture.mjs");
     await writeFile(path, `export default function (pi) {
@@ -89,6 +89,7 @@ async function fixture(t, { child = false, setup = false, empty = false, hermes 
     custom,
     confirm: async (title, message) => { dialogs.push(title); return typeof confirm === "function" ? confirm(title, message) : confirm; },
   };
+  await beforeBind?.(cwd);
   await session.bindExtensions({ mode, uiContext: ui, onError: (error) => errors.push(error) });
   return { session, note, archive, faux, alerts, errors, sessionManager, store, directory, dialogs, cwd };
 }
@@ -96,11 +97,11 @@ async function fixture(t, { child = false, setup = false, empty = false, hermes 
 async function pausedEmbeddingWorker(directory) {
   const workerDirectory = join(directory, "embedding-worker");
   await mkdir(workerDirectory, { recursive: true });
-  const endpoint = await openSocketDirectory(workerDirectory);
+  const endpoint = await openWorkerEndpoint(await realpath(workerDirectory));
   const started = Promise.withResolvers();
   const resumed = Promise.withResolvers();
   let client;
-  const server = createServer((socket) => {
+  const server = await createWorkerServer(endpoint, (socket) => {
     client = socket;
     const reply = (data) => { if (!socket.destroyed) socket.write(JSON.stringify(data) + "\n"); };
     reply({ kind: "ready" });
@@ -119,7 +120,7 @@ async function pausedEmbeddingWorker(directory) {
     resumed.resolve();
     client?.destroy();
     await new Promise((resolve) => server.close(resolve));
-    await endpoint.close();
+    await endpoint.close?.();
   } };
 }
 
@@ -167,6 +168,28 @@ test("unconfigured startup warns without opening the picker; setup command asks 
   assert.equal(faux.state.callCount, 0);
   await assert.rejects(stat(join(directory, "db")), { code: "ENOENT" });
   await assert.rejects(stat(join(directory, "models")), { code: "ENOENT" });
+  assert.deepEqual(errors, []);
+});
+
+test("missing Linux flock warns at startup without blocking Pi or the settings menu", { skip: process.platform !== "linux" }, async (t) => {
+  const path = process.env.PATH;
+  t.after(() => { process.env.PATH = path; });
+  const menus = [];
+  const { session, directory, alerts, errors, faux } = await fixture(t, {
+    setup: true, beforeBind: (cwd) => { process.env.PATH = cwd; },
+    select: async (title) => { menus.push(title); return undefined; },
+  });
+  const warning = "Smart Mem requires flock from util-linux. Install it or add it to PATH.";
+  assert.deepEqual(alerts, [[warning, "warning"]]);
+  await session.prompt("Can Pi still chat?");
+  assert.equal(faux.state.callCount, 1);
+  await session.prompt("/psm-settings");
+  assert.deepEqual(menus, ["Smart Mem settings"]);
+  assert.deepEqual(alerts, [[warning, "warning"]]);
+  await session.prompt("/psm-setup");
+  assert.deepEqual(menus, ["Smart Mem settings"]);
+  assert.deepEqual(alerts.at(-1), [`Smart Mem: Error: ${warning}`, "error"]);
+  await assert.rejects(stat(join(directory, "smart-mem.log")), { code: "ENOENT" });
   assert.deepEqual(errors, []);
 });
 

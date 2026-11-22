@@ -245,10 +245,12 @@ test("model swap leaves old index usable on failure and embeds outside lock", as
 
 test("independent processes share the same store under the held lock", async (t) => {
   const { path, global } = await fixture(t);
-  await withDatabase(path, false, async () => {
-    // This child has an independent descriptor, unlike the lock acquisition helper.
-    await assert.rejects(exec("flock", ["--nonblock", `${path}.lock`, "true"]), { code: 1 });
-  });
+  if (process.platform === "linux") {
+    await withDatabase(path, false, async () => {
+      // Keep contending with the external flock lock family used by older releases.
+      await assert.rejects(exec("flock", ["--nonblock", `${path}.lock`, process.execPath, "--version"]), { code: 1 });
+    });
+  }
   const source = new URL("../src/memory-store.ts", import.meta.url).href;
   const children = Array.from({ length: 4 }, (_, i) => exec(process.execPath, ["--input-type=module", "-e", `
     import { MemoryStore } from ${JSON.stringify(source)};

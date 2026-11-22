@@ -15,7 +15,7 @@ const readId = async (root) => (await readFile(marker(root), "utf8")).trim();
 const embedding = { model: "fixture", values: [1, 0] };
 
 async function git(cwd, ...args) {
-  await exec("git", args, { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  await exec("git", args, { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null" } });
 }
 
 async function fixture(t) {

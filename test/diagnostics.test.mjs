@@ -26,7 +26,7 @@ test("independent diagnostic writers share rotation without losing records; reta
   assert.equal(rows.length, 6);
   assert.equal(new Set(rows.map(({ pid }) => pid)).size, 3);
   for (const source of ["first", "second", "third"]) assert.deepEqual(rows.filter((row) => row.source === source).map(({ event }) => event), ["start", "finish"]);
-  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  if (process.platform !== "win32") assert.equal((await stat(path)).mode & 0o777, 0o600);
   assert.equal((await stat(`${path}.1`)).size, size);
 
   const errors = [];

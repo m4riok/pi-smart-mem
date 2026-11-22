@@ -14,6 +14,7 @@ import { cleanupConflicts, cleanupMode, conflictGuidance } from "./src/conflict-
 import { Diagnostics } from "./src/diagnostics.ts";
 import { databaseQueryDescription, queryDatabase, type DatabaseAccessMode } from "./src/database-access.ts";
 import { commands } from "./src/commands.ts";
+import { checkFileLockBackend } from "./src/file-lock.ts";
 import { JobQueue } from "./src/job-queue.ts";
 import { MemoryPanel, memoryPanelShortcut, type Activity, type Level } from "./src/memory-panel.ts";
 import { MemoryStore, type Scope } from "./src/memory-store.ts";
@@ -63,6 +64,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
   const dbPath = join(directory, "db");
   const main = process.env.PI_SUBAGENT_CHILD !== "1";
   let activePreset: ModelPreset | undefined;
+  let lockProblem: string | undefined;
   let project: string | undefined;
   let store = new MemoryStore(project, dbPath);
   let archive = new Archive(dbPath, project);
@@ -91,13 +93,13 @@ export default function smartMemory(pi: ExtensionAPI): void {
   const registerCommand: ExtensionAPI["registerCommand"] = (name, options) => pi.registerCommand(name, {
     ...options, handler: async (args, ctx) => {
       if (hasPanel(ctx)) panel.clearError();
-      void log.write("command.start", { name });
+      if (!lockProblem) void log.write("command.start", { name });
       await options.handler(args, ctx);
     },
   });
   const begin = (ctx: ExtensionContext, title: string) => hasPanel(ctx) ? panel.begin(title) : undefined;
   function notify(ctx: ExtensionContext, message: string, level: Level = "info", detail?: string, timeoutMs?: number) {
-    void log.write("notice", { message }, level);
+    if (!lockProblem) void log.write("notice", { message }, level);
     present(ctx, message, level, detail, timeoutMs);
   }
   const reportError = (ctx: ExtensionContext, error: unknown, timeoutMs?: number) => notify(ctx, `Smart Mem: ${String(error)}`, "error", String(error), timeoutMs);
@@ -149,7 +151,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
   let lastContext: { projected: Message[]; actual: Message[] } | undefined;
 
   function getStore() {
-    if (!activePreset) throw new Error(`Smart Mem is not set up. Run /${commands.setup} in a main session`);
+    if (!activePreset) throw new Error(lockProblem ?? `Smart Mem is not set up. Run /${commands.setup} in a main session`);
     return store;
   }
   function getArchive() { getStore(); return archive; }
@@ -390,7 +392,14 @@ export default function smartMemory(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     activeContext = ctx;
     activePreset = undefined;
+    lockProblem = undefined;
     if (hasPanel(ctx)) panel.mount(ctx.ui, false);
+    try { await checkFileLockBackend(); }
+    catch (error) {
+      lockProblem = error instanceof Error ? error.message : String(error);
+      if (main && ctx.hasUI) present(ctx, lockProblem, "warning");
+      return;
+    }
     try { activePreset = await openActivePreset(ctx); }
     catch (error) { reportError(ctx, error); return; }
     panel.setActive(!!activePreset);
@@ -445,7 +454,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
     } catch (error) { reportError(ctx, error); }
     finally {
       embeddings.close();
-      await log.write("session.shutdown", { reason: event.reason });
+      if (!lockProblem) await log.write("session.shutdown", { reason: event.reason });
     }
   });
 
@@ -453,7 +462,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
   const isDatabaseTool = (name: string) => main && name === toolNames.databaseQuery;
   pi.on("tool_execution_start", (event, ctx) => {
     const database = isDatabaseTool(event.toolName);
-    if (!database && !exposedNames.has(event.toolName)) return;
+    if (lockProblem || (!database && !exposedNames.has(event.toolName))) return;
     const fields = { name: event.toolName, id: event.toolCallId, mode: database ? databaseAccess : undefined };
     void log.write("tool.start", fields);
     if (database) {
@@ -463,7 +472,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
   const inventoryTools = new Set([toolNames.memoryAdd, toolNames.memoryRemove, toolNames.skillSave]);
   pi.on("tool_execution_end", async (event, ctx) => {
     const database = isDatabaseTool(event.toolName);
-    if (!database && !exposedNames.has(event.toolName)) return;
+    if (lockProblem || (!database && !exposedNames.has(event.toolName))) return;
     const saved = event.result?.details?.saved === true;
     const status = event.isError ? "Failed" : saved ? "Saved" : "Finished";
     const detail = contentText(event.result?.content) || undefined;

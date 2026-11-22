@@ -6,7 +6,8 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import type { Device, ModelPreset, Progress } from "./embeddings.ts";
 import type { Embedding } from "./memory-store.ts";
-import { openSocketDirectory, type Reply, type Request } from "./embedding-protocol.ts";
+import { openWorkerEndpoint } from "./embedding-endpoint.ts";
+import type { Reply, Request } from "./embedding-protocol.ts";
 import { withFileLock } from "./file-lock.ts";
 import type { Diagnostics } from "./diagnostics.ts";
 
@@ -68,7 +69,7 @@ class Connection {
 }
 
 async function connect(directory: string, signal?: AbortSignal): Promise<Connection> {
-  const endpoint = await openSocketDirectory(directory);
+  const endpoint = await openWorkerEndpoint(directory);
   const connection = new Connection(createConnection(endpoint.path));
   try {
     if ((await connection.receive(signal)).kind !== "ready") throw new Error("Unexpected embedding worker greeting");
@@ -77,7 +78,7 @@ async function connect(directory: string, signal?: AbortSignal): Promise<Connect
   } catch (error) {
     connection.socket.destroy();
     throw error;
-  } finally { await endpoint.close(); }
+  } finally { await endpoint.close?.(); }
 }
 
 function workerReady(child: ChildProcess, signal?: AbortSignal): Promise<void> {
@@ -157,18 +158,21 @@ export class SharedEmbeddings {
   }
 
   async #startOrConnect(directory: string, signal?: AbortSignal): Promise<Connection> {
-    try { return await connect(directory, signal); }
+    // Windows and macOS name endpoints by canonical profile; Linux connects by descriptor.
+    const canonical = process.platform === "linux" ? undefined : await realpath(this.#profile);
+    const endpointDirectory = canonical === undefined ? directory : join(canonical, "embedding-worker");
+    try { return await connect(endpointDirectory, signal); }
     catch (error) {
       if (!["ENOENT", "ECONNREFUSED", "ECONNRESET"].includes((error as NodeJS.ErrnoException)?.code ?? "")) throw error;
     }
-    const profile = await realpath(this.#profile);
+    const profile = canonical ?? await realpath(this.#profile);
     signal?.throwIfAborted();
     const child = fork(fileURLToPath(new URL("./embedding-worker-entry.mjs", import.meta.url)), [profile], {
       detached: true, execArgv: ["--disable-warning=ExperimentalWarning"], stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
     try {
       await workerReady(child, signal);
-      return await connect(directory, signal);
+      return await connect(endpointDirectory, signal);
     } finally {
       if (child.connected) child.disconnect();
       child.unref();
