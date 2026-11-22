@@ -12,6 +12,8 @@ export function contentText(content: unknown): string {
   return content.filter((part) => part?.type === "text" && typeof part.text === "string").map((part) => part.text).join("\n");
 }
 
+export type Pin = { id: RecordId<"smart_pin">; scope: Scope; text: string };
+type PinRow = Pick<Pin, "id" | "text"> & { project?: string };
 type SkillDraft = { name: string; description: string; text: string; scope: Scope };
 type SkillRow = Omit<SkillDraft, "scope"> & { id: RecordId<"smart_skill", string>; project?: string };
 export const transcriptRoles = ["user", "assistant"] as const;
@@ -47,9 +49,21 @@ export class Archive {
   }
 
   async pins() {
+    return (await this.listPins()).map(({ text }) => text);
+  }
+
+  async listPins(): Promise<Pin[]> {
     return withDatabase(this.#path, false, async (db) => {
-      const [rows] = await db.query<[{ text: string }[]]>(`SELECT text, created FROM smart_pin WHERE ${inScope} ORDER BY created`, { project: this.#project });
-      return rows.map(({ text }) => text);
+      const [rows] = await db.query<[PinRow[]]>(`SELECT id, text, project, created FROM smart_pin WHERE ${inScope} ORDER BY created`, { project: this.#project });
+      return rows.map(({ id, text, project }) => ({ id, text, scope: project === undefined ? "global" : "project" }));
+    });
+  }
+
+  async removePin({ id, scope }: Pin): Promise<boolean> {
+    const project = this.#scope(scope);
+    return withDatabase(this.#path, false, async (db) => {
+      const [rows] = await db.query<[PinRow[]]>("DELETE $id WHERE project = $project RETURN BEFORE", { id, project });
+      return rows.length > 0;
     });
   }
 

@@ -87,7 +87,7 @@ async function fixture(t, { child = false, setup = false, empty = false, hermes 
       return options[0];
     }),
     custom,
-    confirm: async (title) => { dialogs.push(title); return confirm; },
+    confirm: async (title, message) => { dialogs.push(title); return typeof confirm === "function" ? confirm(title, message) : confirm; },
   };
   await session.bindExtensions({ mode, uiContext: ui, onError: (error) => errors.push(error) });
   return { session, note, archive, faux, alerts, errors, sessionManager, store, directory, dialogs, cwd };
@@ -822,6 +822,82 @@ test("interactive Memory panel separates scoped counts and refreshes after write
   ]);
   await session.prompt("Update the stored fixtures");
   assert.match(counts(), /Project: 0 mem · 1 skills · 1 pins  │  Global: 0 mem · 0 skills · 1 pins/);
+  assert.deepEqual(errors, []);
+});
+
+test("Pins settings show scoped pins and only remove confirmed pins from future prompts", async (t) => {
+  initTheme("dark", false);
+  let panel;
+  let requested;
+  let chooser;
+  let confirmation;
+  const { session, note, store, archive, faux, directory, cwd, errors } = await fixture(t, {
+    mode: "tui",
+    setWidget: (key, build) => {
+      if (key === "smart-mem") panel = build?.({ requestRender() {} }, { fg: (_color, text) => text });
+    },
+    custom: async (factory) => {
+      if (!requested?.open) return undefined;
+      requested.open = false;
+      let value;
+      const component = factory({ requestRender() {} }, undefined, getKeybindings(), (choice) => { value = choice; });
+      component.handleInput("Pins");
+      component.handleInput("\r");
+      return value;
+    },
+    select: async (title, options) => {
+      if (title === "Pins") return options.find((option) => option === requested.group);
+      chooser = { title, options };
+      return options[0];
+    },
+    confirm: (title, text) => {
+      confirmation = { title, text };
+      return requested.approve;
+    },
+  });
+  await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
+  const project = await resolveProject(cwd, join(directory, "db"));
+  const local = new Archive(join(directory, "db"), project);
+  const other = new Archive(join(directory, "db"), "unrelated-project");
+  await other.pin("project", "Unrelated pin");
+  const localText = "Keep local fixtures.";
+  const globalText = "Standing pin fixture";
+  await session.prompt(`/psm-pin ${localText}`);
+  let observedPrompt;
+  const inspect = async () => {
+    faux.setResponses([({ messages }) => {
+      observedPrompt = getCurrentSystemPrompt(messages);
+      return fauxAssistantMessage("Fixture response");
+    }]);
+    await session.prompt("Describe test setup");
+    return observedPrompt;
+  };
+  const manage = async (group, approve, text) => {
+    requested = { group, approve, open: true };
+    chooser = confirmation = undefined;
+    await session.prompt("/psm-settings");
+    assert.deepEqual(chooser, { title: `${group} pins (select to view or remove)`, options: [`1. ${text}`] });
+    assert.deepEqual(confirmation, { title: `Remove ${group.toLowerCase()} pin?`, text });
+  };
+  const counts = () => panel.render(100).join("\n");
+  assert.ok((await inspect()).includes(localText));
+  await manage("Project", false, localText);
+  assert.ok((await local.pins()).includes(localText));
+  assert.match(counts(), /Project: 0 mem · 0 skills · 1 pins/);
+
+  await manage("Project", true, localText);
+  assert.deepEqual(await local.pins(), [globalText]);
+  assert.match(counts(), /Project: 0 mem · 0 skills · 0 pins/);
+  const afterProjectRemoval = await inspect();
+  assert.ok(!afterProjectRemoval.includes(localText));
+  assert.ok(afterProjectRemoval.includes(globalText));
+
+  await manage("Global", true, globalText);
+  assert.deepEqual(await archive.pins(), []);
+  assert.match(counts(), /Global: 1 mem · 0 skills · 0 pins/);
+  assert.ok(!(await inspect()).includes(globalText));
+  assert.deepEqual(await other.pins(), ["Unrelated pin"]);
+  assert.deepEqual(await store.read(note.id), note);
   assert.deepEqual(errors, []);
 });
 

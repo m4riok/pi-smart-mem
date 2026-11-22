@@ -8,6 +8,7 @@ import { Container, SelectList, SettingsList, Text, truncateToWidth } from "@ear
 import { cudaRequirements, embeddingDevice, models, type Device, type ModelPreset } from "./embeddings.ts";
 import { withFileLock } from "./file-lock.ts";
 import type { Diagnostics } from "./diagnostics.ts";
+import type { Pin } from "./archive.ts";
 import { databaseAccessModes, type DatabaseAccessMode } from "./database-access.ts";
 import { currentToolName, toolNames } from "./memory-tools.ts";
 
@@ -159,6 +160,7 @@ export type SettingsActions = {
   setup: () => Promise<boolean>; device: (device: Device) => Promise<void>;
   backfill: () => Promise<void>; prune: () => Promise<void>;
   databaseAccess: () => DatabaseAccessMode; setDatabaseAccess: (mode: DatabaseAccessMode) => void;
+  listPins: () => Promise<Pin[]>; removePin: (pin: Pin) => Promise<void>;
 };
 
 async function settingsMenu(ctx: ExtensionContext, settings: Settings, modelName: string, databaseAccess: DatabaseAccessMode) {
@@ -168,7 +170,7 @@ async function settingsMenu(ctx: ExtensionContext, settings: Settings, modelName
     ["Review reasoning", settings.reviewReasoning ?? "Inherit"], ["Review tools", `${settings.reviewTools.length} enabled`],
     ["Trigger phrases", "Edit"], ["Thresholds", "Edit"], ["Automatic linking", settings.autoLink ? "On" : "Off"],
     ["Model prompts", "Edit"], ["Transcript index", "Manage"], ["Debug logging", settings.debugLogging ? "ON" : "OFF"],
-    ["Database access (this session)", databaseAccess],
+    ["Database access (this session)", databaseAccess], ["Pins", "Manage"],
   ];
   if (ctx.mode !== "tui") {
     const options = labels.map(([label, value]) => `${label}: ${value}`);
@@ -290,6 +292,21 @@ export async function openSettings(ctx: ExtensionContext, file: SettingsFile, re
         const action = await ctx.ui.select("Transcript index", ["Backfill Pi sessions", "Prune index"]);
         if (action === "Backfill Pi sessions") await actions.backfill();
         if (action === "Prune index") await actions.prune();
+        break;
+      }
+      case 12: {
+        const group = await ctx.ui.select("Pins", ["Project", "Global"]);
+        if (group !== "Project" && group !== "Global") break;
+        const scope = group === "Project" ? "project" : "global";
+        const pins = (await actions.listPins()).filter((pin) => pin.scope === scope);
+        if (!pins.length) {
+          ctx.ui.notify(`No ${scope} pins`, "info");
+          break;
+        }
+        const labels = pins.map(({ text }, i) => `${i + 1}. ${truncateToWidth(text.replace(/\s+/g, " "), 80)}`);
+        const selected = await ctx.ui.select(`${group} pins (select to view or remove)`, labels);
+        const pin = selected === undefined ? undefined : pins[labels.indexOf(selected)];
+        if (pin && await ctx.ui.confirm(`Remove ${scope} pin?`, pin.text)) await actions.removePin(pin);
         break;
       }
     }

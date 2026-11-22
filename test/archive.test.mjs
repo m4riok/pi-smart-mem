@@ -32,6 +32,29 @@ test("pins and reusable skills respect repo and global scopes across connections
   assert.equal((await a.saveSkill({ ...data, scope: "project", text: "Run the extended verification fixture" }, local.id)).text, "Run the extended verification fixture");
 });
 
+test("pin removal targets one record and respects current project and global scope", async (t) => {
+  const { a, b, global } = await fixture(t);
+  const text = "Shared pin wording";
+  await a.pin("project", text);
+  await a.pin("project", text);
+  await b.pin("project", "Another project's pin");
+  await global.pin("global", text);
+  const visible = await a.listPins();
+  const [first, second] = visible.filter(({ scope }) => scope === "project");
+  const [shared] = visible.filter(({ scope }) => scope === "global");
+  assert.equal(visible.length, 3);
+  assert.notEqual(first.id.id, second.id.id);
+  assert.equal(await b.removePin(first), false);
+  assert.equal(await a.removePin({ ...first, scope: "global" }), false);
+  assert.equal(await a.removePin(first), true);
+  assert.equal(await a.removePin(first), false);
+  assert.deepEqual(new Set((await a.listPins()).map(({ id }) => id.id)), new Set([second.id.id, shared.id.id]));
+  assert.equal(await a.removePin(shared), true);
+  assert.deepEqual(await a.pins(), [text]);
+  assert.deepEqual(await b.pins(), ["Another project's pin"]);
+  assert.deepEqual(await global.pins(), []);
+});
+
 test("backfill skips subagent artifacts, is idempotent, and leaves originals untouched", async (t) => {
   const { root, a } = await fixture(t);
   const directory = join(root, "sessions");

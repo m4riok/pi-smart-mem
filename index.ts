@@ -607,6 +607,15 @@ export default function smartMemory(pi: ExtensionAPI): void {
         await openSettings(ctx, file, [...reviewTools.map(({ name }) => name), toolNames.reinforceMemory], {
           model: () => activePreset, databaseAccess: () => databaseAccess, setDatabaseAccess,
           setup: () => setup(ctx), device: (device) => setDevice(ctx, device),
+          listPins: () => getArchive().listPins(),
+          removePin: async (pin) => {
+            if (!await getArchive().removePin(pin)) {
+              notify(ctx, `Pin no longer available in ${pin.scope} scope`, "warning");
+              return;
+            }
+            await refreshCounts(ctx);
+            notify(ctx, `Removed ${pin.scope} pin`);
+          },
           backfill: async () => {
             const a = getArchive();
             const count = await progress(ctx, "Backfilling past Pi conversations", (log) => a.backfill(join(getAgentDir(), "sessions"), log));
