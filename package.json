@@ -1,6 +1,6 @@
 {
   "name": "pi-smart-mem",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Persistent project and global memory for Pi with local embeddings",
   "keywords": ["pi-package", "memory", "semantic-search"],
   "type": "module",
@@ -14,7 +14,9 @@
   },
   "files": [
     "index.ts",
-    "src/"
+    "src/",
+    "example-search.svg",
+    "pi-smart-mem.png"
   ],
   "engines": {
     "node": ">=22.19"
