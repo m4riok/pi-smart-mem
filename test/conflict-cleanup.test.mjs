@@ -102,5 +102,66 @@ test("memory-only cleanup does not read guidance or choose between tied revision
   assert.deepEqual(result, { changes: 0, skipped: 0 });
   assert.deepEqual(await store.read(first.id), first);
   assert.deepEqual(await store.read(second.id), second);
+  assert.deepEqual(await store.list("global", "unchecked-conflicts"), []);
   assert.throws(() => cleanupMode("--memory-only"), /guidance-only, or memory-only/);
+});
+
+test("incremental conflict cleanup keeps checked targets eligible and retries only pending sources", async (t) => {
+  const { store, add, run, failures } = await fixture(t);
+  const old = await add("project", "note", "Use npm locally", 1000);
+  const other = await add("global", "note", "Use npm globally", 1500);
+  const memoryOnly = (choose) => run("memory-only", choose, () => assert.fail("Unexpected guidance lookup"));
+  await memoryOnly(() => assert.fail("No same-scope candidate"));
+  assert.deepEqual(await store.list("project", "unchecked-conflicts"), []);
+  assert.deepEqual(await store.list("global", "unchecked-conflicts"), []);
+  await store.replace(old.id, old.text, embedding);
+  await store.reclassify([{ note: old, kind: "guideline" }]);
+  await store.reinforce(old.id, "fixture");
+  await store.markConsolidated(old, true);
+  assert.deepEqual(await store.list("project", "unchecked-conflicts"), []);
+
+  const fresh = await add("project", "preference", "Use pnpm locally", 2000);
+  const attempts = [];
+  assert.deepEqual(await memoryOnly((_tool, { source, candidates }) => {
+    attempts.push(source.id);
+    assert.deepEqual(candidates.map(({ id }) => id), [old.id]);
+    return { ids: [other.id], text: source.text };
+  }), { changes: 0, skipped: 1 });
+  assert.deepEqual(attempts, [fresh.id, fresh.id]);
+  assert.equal(failures.length, 2);
+  assert.deepEqual(await store.list("project", "unchecked-conflicts"), [fresh]);
+
+  assert.deepEqual(await memoryOnly((_tool, { source, candidates }) => {
+    assert.equal(source.id, fresh.id);
+    assert.deepEqual(candidates.map(({ id }) => id), [old.id]);
+    return { ids: [old.id], text: source.text };
+  }), { changes: 1, skipped: 0 });
+  assert.equal(await store.read(old.id), undefined);
+  assert.deepEqual(await store.list("project", "unchecked-conflicts"), []);
+  assert.deepEqual(await memoryOnly(() => assert.fail("Unchanged rerun must not judge again")), { changes: 0, skipped: 0 });
+
+  const edited = await store.replace(fresh.id, "Use pnpm from the project root", embedding);
+  await store.markConflictChecked(fresh);
+  assert.deepEqual(await store.list("project", "unchecked-conflicts"), [edited]);
+  await memoryOnly(() => assert.fail("No same-scope candidate after merge"));
+  assert.deepEqual(await store.list("project", "unchecked-conflicts"), []);
+  const guidance = [{ source: "fixture", text: "Remove location requirement" }];
+  assert.deepEqual(await run("guidance-only", (_tool, { notes }) => ({ updates: notes[0].id === fresh.id
+    ? [{ id: fresh.id, text: "Use pnpm" }] : [] }), async () => ({ project: guidance, global: guidance })), { changes: 1, skipped: 0 });
+  assert.deepEqual((await store.list("project", "unchecked-conflicts")).map(({ text }) => text), ["Use pnpm"]);
+});
+
+test("a conflict merge that changes a checked target makes its new text pending", async (t) => {
+  const { store, add, run, failures } = await fixture(t);
+  const newer = await add("global", "note", "Use pnpm", 2000);
+  await store.markConflictChecked(newer);
+  const older = await add("global", "note", "Use npm. Use local fixtures.", 1000);
+  const result = await run("memory-only", (_tool, { source, candidates }) => {
+    assert.equal(source.id, older.id);
+    assert.deepEqual(candidates.map(({ id }) => id), [newer.id]);
+    return { ids: [newer.id], text: "Use pnpm. Use local fixtures." };
+  }, () => assert.fail("Unexpected guidance lookup"));
+  assert.deepEqual(failures, []);
+  assert.deepEqual(result, { changes: 1, skipped: 0 });
+  assert.deepEqual(await store.list("global", "unchecked-conflicts"), [{ ...newer, text: "Use pnpm. Use local fixtures." }]);
 });

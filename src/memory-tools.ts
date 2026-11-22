@@ -30,6 +30,7 @@ export const toolNames = {
   skillRead: `${prefix}skill_read`,
   skillSave: `${prefix}skill_save`,
   sessionSearch: `${prefix}session_search`,
+  databaseQuery: `${prefix}db_query`,
   selectMemories: `${prefix}select_memories`,
   selectLinks: `${prefix}select_links`,
   consolidateNote: `${prefix}consolidate_note`,
@@ -90,9 +91,9 @@ function terminalText(text: string) {
   return text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 }
 
-export function registerTools(pi: ExtensionAPI, tools: Operation[]) {
+export function registerTools(pi: ExtensionAPI, tools: Operation[], defaultActive?: boolean) {
   for (const tool of tools) pi.registerTool<TSchema, { saved?: boolean }>({
-    name: tool.name, label: tool.name, description: tool.description, parameters: tool.parameters as TSchema,
+    name: tool.name, label: tool.name, description: tool.description, parameters: tool.parameters as TSchema, defaultActive,
     renderCall(args, theme, { expanded, isPartial, executionStarted }) {
       const title = theme.fg("toolTitle", theme.bold(tool.name));
       const pending = isPartial ? theme.fg("toolOutput", executionStarted ? "Running" : "Pending") : undefined;

@@ -218,6 +218,7 @@ export class MemoryStore {
       signal?.throwIfAborted();
       const [rows] = await db.query<[StoredMemory[]]>(`UPDATE $id SET consolidated = IF text != $text { NONE } ELSE { consolidated },
         linkChecked = IF text != $text { NONE } ELSE { linkChecked },
+        conflictChecked = IF text != $text { NONE } ELSE { conflictChecked },
         revisedAt = IF text != $text { time::millis() } ELSE { revisedAt }, text = $text, ${field} = $embedding
         WHERE ${visible} RETURN ${projection}`, this.#bind({ id: record(id), text, embedding: embedding.values }));
       return rows[0] && memory(rows[0]);
@@ -258,7 +259,7 @@ export class MemoryStore {
         FOR $change IN $updates {
           LET $id = $change.id;
           IF $change.text = NONE { DELETE $id; }
-          ELSE { UPDATE $id SET text = $change.text, consolidated = NONE, linkChecked = NONE, ${field} = $change.embedding; };
+          ELSE { UPDATE $id SET text = $change.text, consolidated = NONE, linkChecked = NONE, conflictChecked = NONE, ${field} = $change.embedding; };
         };
         COMMIT TRANSACTION;`, { updates });
       return updates.length;
@@ -429,17 +430,26 @@ export class MemoryStore {
     });
   }
 
-  async list(scope: Scope, selection?: "unconsolidated"): Promise<Memory[]> {
+  async list(scope: Scope, selection?: "unconsolidated" | "unchecked-conflicts"): Promise<Memory[]> {
     const filter = scope === "project" ? currentProject : globalScope;
-    const pending = selection === "unconsolidated" ? " AND consolidated != true" : "";
+    const pending = selection === "unconsolidated" ? " AND consolidated != true"
+      : selection === "unchecked-conflicts" ? " AND conflictChecked != true" : "";
     const [rows] = await this.#use((db) => db.query<[StoredMemory[]]>(`SELECT ${projection} FROM memory WHERE ${filter}${pending} ORDER BY id`, this.#bind({})).collect());
     return rows.map(memory);
   }
 
   async markConsolidated(note: Memory, checked: boolean, signal?: AbortSignal): Promise<void> {
+    await this.#markChecked(note, "consolidated", checked, signal);
+  }
+
+  async markConflictChecked(note: Memory, signal?: AbortSignal): Promise<void> {
+    await this.#markChecked(note, "conflictChecked", true, signal);
+  }
+
+  async #markChecked(note: Memory, field: "consolidated" | "conflictChecked", checked: boolean, signal?: AbortSignal): Promise<void> {
     await this.#use(async (db) => {
       signal?.throwIfAborted();
-      await db.query(`UPDATE $id SET consolidated = $checked WHERE ${visible} AND text = $text AND revisedAt = $revisedAt`,
+      await db.query(`UPDATE $id SET ${field} = $checked WHERE ${visible} AND text = $text AND revisedAt = $revisedAt`,
         this.#bind({ id: record(note.id), text: note.text, revisedAt: note.revisedAt, checked }));
     }, signal);
   }
@@ -459,7 +469,7 @@ export class MemoryStore {
     });
   }
 
-  async merge(survivor: Memory, removed: Memory[], text: string, embedding: Embedding, signal?: AbortSignal, consolidated = false): Promise<boolean> {
+  async merge(survivor: Memory, removed: Memory[], text: string, embedding: Embedding, signal?: AbortSignal, check?: "consolidation" | "conflict"): Promise<boolean> {
     const expected = [survivor, ...removed];
     if (new Set(expected.map(({ id }) => id)).size !== expected.length || removed.some(({ project }) => project !== survivor.project)) {
       throw new Error("Consolidation requires distinct memories in the same scope");
@@ -486,7 +496,9 @@ export class MemoryStore {
       signal?.throwIfAborted();
       await db.query(`BEGIN TRANSACTION;
         UPDATE $keep SET consolidated = IF $consolidated { true } ELSE IF text = $text { consolidated } ELSE { NONE },
-          linkChecked = IF text = $text { linkChecked } ELSE { NONE }, text = $text, weight = $weight, ${field} = $embedding;
+          linkChecked = IF text = $text { linkChecked } ELSE { NONE },
+          conflictChecked = IF text != $text { NONE } ELSE IF $conflictChecked { true } ELSE { conflictChecked },
+          text = $text, weight = $weight, ${field} = $embedding;
         DELETE $discard;
         FOR $edge IN $edges {
           LET $from = $edge.from;
@@ -495,7 +507,8 @@ export class MemoryStore {
             RELATE $from->memory_link->$to;
           };
         };
-        COMMIT TRANSACTION;`, { keep, discard, text, weight, consolidated, embedding: embedding.values, edges: [...redirected.values()] });
+        COMMIT TRANSACTION;`, { keep, discard, text, weight, consolidated: check === "consolidation",
+        conflictChecked: check === "conflict", embedding: embedding.values, edges: [...redirected.values()] });
       return true;
     });
   }

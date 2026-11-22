@@ -12,6 +12,7 @@ import { linkMemories, type LinkOptions } from "./src/linking.ts";
 import { reclassifyMemories, type BatchOptions } from "./src/maintenance-batch.ts";
 import { cleanupConflicts, cleanupMode, conflictGuidance } from "./src/conflict-cleanup.ts";
 import { Diagnostics } from "./src/diagnostics.ts";
+import { databaseQueryDescription, queryDatabase, type DatabaseAccessMode } from "./src/database-access.ts";
 import { commands } from "./src/commands.ts";
 import { JobQueue } from "./src/job-queue.ts";
 import { MemoryPanel, memoryPanelShortcut, type Activity, type Level } from "./src/memory-panel.ts";
@@ -66,6 +67,8 @@ export default function smartMemory(pi: ExtensionAPI): void {
   let store = new MemoryStore(project, dbPath);
   let archive = new Archive(dbPath, project);
   let activeContext: ExtensionContext | undefined;
+  let databaseAccess: DatabaseAccessMode = "Disabled";
+  let debugDatabaseQueries = false;
   let pending: (UserTrigger & { timestamp: number })[] = [];
   let turns = 0;
   let calls = 0;
@@ -402,7 +405,12 @@ export default function smartMemory(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", async (event, ctx) => {
     activeContext = ctx;
+    const activeTools = pi.getActiveTools();
+    if (databaseAccess === "Disabled" && activeTools.includes(toolNames.databaseQuery)) {
+      pi.setActiveTools(activeTools.filter((name) => name !== toolNames.databaseQuery));
+    }
     const settings = await file.read();
+    debugDatabaseQueries = settings.debugLogging;
     if (!activePreset) return;
     const pins = await archive.pins();
     const active = new Set(pi.getActiveTools());
@@ -442,25 +450,59 @@ export default function smartMemory(pi: ExtensionAPI): void {
   });
 
   const exposedNames = new Set(tools.map(({ name }) => name));
+  const isDatabaseTool = (name: string) => main && name === toolNames.databaseQuery;
   pi.on("tool_execution_start", (event, ctx) => {
-    if (!exposedNames.has(event.toolName)) return;
-    void log.write("tool.start", { name: event.toolName, id: event.toolCallId });
-    if (hasPanel(ctx)) toolActivity.set(event.toolCallId, panel.begin(event.toolName));
+    const database = isDatabaseTool(event.toolName);
+    if (!database && !exposedNames.has(event.toolName)) return;
+    const fields = { name: event.toolName, id: event.toolCallId, mode: database ? databaseAccess : undefined };
+    void log.write("tool.start", fields);
+    if (database) {
+      if (debugDatabaseQueries) void log.debug("database.query.request", { ...fields, query: event.args?.query });
+    } else if (hasPanel(ctx)) toolActivity.set(event.toolCallId, panel.begin(event.toolName));
   });
   const inventoryTools = new Set([toolNames.memoryAdd, toolNames.memoryRemove, toolNames.skillSave]);
   pi.on("tool_execution_end", async (event, ctx) => {
-    if (!exposedNames.has(event.toolName)) return;
+    const database = isDatabaseTool(event.toolName);
+    if (!database && !exposedNames.has(event.toolName)) return;
     const saved = event.result?.details?.saved === true;
     const status = event.isError ? "Failed" : saved ? "Saved" : "Finished";
     const detail = contentText(event.result?.content) || undefined;
-    void log.write("tool.finish", { name: event.toolName, id: event.toolCallId, status, ms: event.durationMs,
-      error: event.isError ? detail : undefined }, event.isError ? "error" : "info");
+    const fields = { name: event.toolName, id: event.toolCallId, mode: database ? databaseAccess : undefined, status, ms: event.durationMs };
+    // Database errors can echo the full SQL, including private literals.
+    void log.write("tool.finish", { ...fields, error: !database && event.isError ? detail : undefined }, event.isError ? "error" : "info");
+    if (database) {
+      if (debugDatabaseQueries) void log.debug("database.query.result", { ...fields, isError: event.isError, result: detail });
+      return;
+    }
     toolActivity.get(event.toolCallId)?.finish(`${event.toolName} · ${status}`, event.isError ? "error" : "info", detail);
     toolActivity.delete(event.toolCallId);
     if (saved && inventoryTools.has(event.toolName)) await refreshCounts(ctx);
   });
 
   if (!main) return;
+
+  let databaseToolRegistered = false;
+  function setDatabaseAccess(mode: DatabaseAccessMode) {
+    if (mode !== "Disabled") {
+      getStore();
+      if (!databaseToolRegistered) {
+        registerTools(pi, [operation(toolNames.databaseQuery, databaseQueryDescription,
+          Type.Object({ query: Type.String({ minLength: 1 }) }), async ({ query }, signal) => {
+            const mode = databaseAccess;
+            if (mode === "Disabled") throw new Error("Smart Mem database access is disabled for this session");
+            getStore();
+            return { value: await queryDatabase(dbPath, mode, query, signal) };
+          })], false);
+        databaseToolRegistered = true;
+      }
+    }
+    const previous = databaseAccess;
+    databaseAccess = mode;
+    const tools = pi.getActiveTools().filter((name) => name !== toolNames.databaseQuery);
+    if (mode !== "Disabled") tools.push(toolNames.databaseQuery);
+    pi.setActiveTools(tools);
+    if (mode !== previous) void log.write("database.access", { previous, mode });
+  }
 
   pi.registerShortcut(memoryPanelShortcut, { description: "Toggle Memory panel details", handler: (ctx) => { if (hasPanel(ctx)) panel.toggle(); } });
 
@@ -563,7 +605,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
       await ctx.waitForIdle();
       try {
         await openSettings(ctx, file, [...reviewTools.map(({ name }) => name), toolNames.reinforceMemory], {
-          model: () => activePreset,
+          model: () => activePreset, databaseAccess: () => databaseAccess, setDatabaseAccess,
           setup: () => setup(ctx), device: (device) => setDevice(ctx, device),
           backfill: async () => {
             const a = getArchive();

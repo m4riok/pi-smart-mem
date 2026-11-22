@@ -8,6 +8,7 @@ import { Container, SelectList, SettingsList, Text, truncateToWidth } from "@ear
 import { cudaRequirements, embeddingDevice, models, type Device, type ModelPreset } from "./embeddings.ts";
 import { withFileLock } from "./file-lock.ts";
 import type { Diagnostics } from "./diagnostics.ts";
+import { databaseAccessModes, type DatabaseAccessMode } from "./database-access.ts";
 import { currentToolName, toolNames } from "./memory-tools.ts";
 
 export const minConsolidationSavings = { characters: 30, percent: 5 } as const;
@@ -153,15 +154,17 @@ export async function chooseEmbeddingModel(ctx: ExtensionContext, current: Model
 export type SettingsActions = {
   setup: () => Promise<boolean>; device: (device: Device) => Promise<void>;
   backfill: () => Promise<void>; prune: () => Promise<void>;
+  databaseAccess: () => DatabaseAccessMode; setDatabaseAccess: (mode: DatabaseAccessMode) => void;
 };
 
-async function settingsMenu(ctx: ExtensionContext, settings: Settings, modelName: string) {
+async function settingsMenu(ctx: ExtensionContext, settings: Settings, modelName: string, databaseAccess: DatabaseAccessMode) {
   const labels = [
     ["Embedding model", modelName], ["Embedding device", settings.device.toUpperCase()],
     ["Review model", settings.reviewModel ? `${settings.reviewModel.provider}/${settings.reviewModel.id}` : "Inherit"],
     ["Review reasoning", settings.reviewReasoning ?? "Inherit"], ["Review tools", `${settings.reviewTools.length} enabled`],
     ["Trigger phrases", "Edit"], ["Thresholds", "Edit"], ["Automatic linking", settings.autoLink ? "On" : "Off"],
     ["Model prompts", "Edit"], ["Transcript index", "Manage"], ["Debug logging", settings.debugLogging ? "ON" : "OFF"],
+    ["Database access (this session)", databaseAccess],
   ];
   if (ctx.mode !== "tui") {
     const options = labels.map(([label, value]) => `${label}: ${value}`);
@@ -188,7 +191,7 @@ export async function openSettings(ctx: ExtensionContext, file: SettingsFile, re
     const saved = await file.read();
     const s = { ...saved, reviewTools: saved.reviewTools.filter((name) => reviewTools.includes(name)) };
     const model = actions.model();
-    const choice = await settingsMenu(ctx, { ...s, device: embeddingDevice(model, s.device) }, model?.model ?? "Not set up");
+    const choice = await settingsMenu(ctx, { ...s, device: embeddingDevice(model, s.device) }, model?.model ?? "Not set up", actions.databaseAccess());
     if (choice === undefined) return;
     switch (choice) {
       case 0:
@@ -271,6 +274,12 @@ export async function openSettings(ctx: ExtensionContext, file: SettingsFile, re
       case 10: {
         const enabled = await ctx.ui.select("Debug logging (includes saved note text and model replies in smart-mem.log)", ["OFF", "ON"]);
         if (enabled === "ON" || enabled === "OFF") await file.update({ debugLogging: enabled === "ON" });
+        break;
+      }
+      case 11: {
+        const selected = await ctx.ui.select("Database access for this session (raw queries across projects)", [...databaseAccessModes]);
+        const mode = databaseAccessModes.find((mode) => mode === selected);
+        if (mode) actions.setDatabaseAccess(mode);
         break;
       }
       case 9: {

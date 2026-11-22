@@ -74,24 +74,30 @@ async function cleanAgainstMemories(options: BatchOptions, embed: Embed): Promis
   const total = { changes: 0, skipped: 0 };
   for (const scope of scopes) {
     signal?.throwIfAborted();
-    const notes = await store.list(scope);
+    const notes = await store.list(scope, "unchecked-conflicts");
     for (const [i, { id: sourceId }] of notes.entries()) {
       const outcome = await retryDecision(options, scope, [sourceId], `Checking ${scope} memory conflicts: ${i + 1}/${notes.length}`, async (fields) => {
         const source = await store.read(sourceId);
         if (!source) return 0;
         const candidates = await store.candidates(source, maintenanceShortlistSize, true);
-        if (!candidates.some(({ revisedAt }) => revisedAt !== source.revisedAt)) return 0;
+        if (!candidates.some(({ revisedAt }) => revisedAt !== source.revisedAt)) {
+          await store.markConflictChecked(source, signal);
+          return 0;
+        }
         let changes = 0;
         const tool = operation(toolNames.cleanupMemory, "Submit genuinely conflicting candidate IDs and complete text of the newest position. Omit text and pass an empty list if none.",
           Type.Object({ ids: Type.Array(id), text: Type.Optional(replacementText) }), async ({ ids, text }, signal) => {
-            if (!ids.length) return { value: { changes } };
+            if (!ids.length) {
+              await store.markConflictChecked(source, signal);
+              return { value: { changes } };
+            }
             const conflicts = resolveBatch(candidates, ids.map((id) => ({ id }))).map(({ note }) => note);
             const [keep, ...remove] = [source, ...conflicts].sort((a, b) => b.revisedAt - a.revisedAt);
             if (keep.revisedAt === remove[0].revisedAt) throw new Error("Conflicting memories tie for latest substantive revision");
             const replacement = text?.trim();
             if (!replacement) throw new Error("A conflict merge requires complete replacement text");
             const embedding = await embed(replacement, signal);
-            if (await store.merge(keep, remove, replacement, embedding, signal)) changes = remove.length;
+            if (await store.merge(keep, remove, replacement, embedding, signal, keep.id === source.id ? "conflict" : undefined)) changes = remove.length;
             return { value: { changes } };
           });
         await requestDecision(options, fields, prompt(settings, "cleanupMemory"), { source, candidates }, tool);

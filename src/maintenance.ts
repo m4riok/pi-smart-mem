@@ -43,7 +43,7 @@ async function judgeNote(options: Options, id: string, attempt: 1 | 2, retryDeci
     });
     if (removed.length && !text) throw new Error("A merge needs replacement text");
     if (text && (removed.length || savesEnough(source.text, text))) {
-      if (await store.merge(source, removed, text, await embed(text, signal), signal, true)) result.changes++;
+      if (await store.merge(source, removed, text, await embed(text, signal), signal, "consolidation")) result.changes++;
     } else await store.markConsolidated(source, true, signal);
     judged = true;
     return { value: { changes: result.changes } };

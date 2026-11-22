@@ -1,9 +1,12 @@
 import { NotFoundError, type Surreal } from "surrealdb";
+import { databaseAccessSchema } from "./database-access.ts";
 
 // Version zero is the initialized schema before version tracking was added.
 const migrations = [
   "DEFINE FIELD IF NOT EXISTS consolidated ON memory TYPE option<bool>;",
-  "DEFINE FIELD IF NOT EXISTS linkChecked ON memory TYPE option<bool>;"
+  "DEFINE FIELD IF NOT EXISTS linkChecked ON memory TYPE option<bool>;",
+  "DEFINE FIELD IF NOT EXISTS conflictChecked ON memory TYPE option<bool>;",
+  databaseAccessSchema,
 ] as const;
 
 const schemaTable = "smart_schema";

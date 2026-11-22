@@ -180,26 +180,129 @@ test("startup displays and logs database upgrades, and blocks unsupported schema
   } });
   const path = join(directory, "db");
   const query = (sql) => withDatabase(path, false, (db) => db.query(sql).collect());
-  await query("UPDATE smart_schema:current SET version = 1; REMOVE FIELD linkChecked ON memory;");
+  await query("UPDATE smart_schema:current SET version = 3;");
   await session.reload();
-  assert.ok(frames.some((frame) => frame.includes("Schema 1 → 2")), JSON.stringify(frames));
-  assert.match(render(), /Smart Mem database upgraded to schema 2/);
+  assert.ok(frames.some((frame) => frame.includes("Schema 3 → 4")), JSON.stringify(frames));
+  assert.match(render(), /Smart Mem database upgraded to schema 4/);
   assert.deepEqual(await store.read(note.id), note);
   await session.reload();
   assert.doesNotMatch(render(), /database upgraded/);
   const log = async () => (await readFile(join(directory, "smart-mem.log"), "utf8")).trim().split("\n").map(JSON.parse);
   assert.deepEqual((await log()).filter(({ event }) => event.startsWith("schema.migration.")).map(({ event, from, to }) => ({ event, from, to })), [
-    { event: "schema.migration.start", from: 1, to: 2 },
-    { event: "schema.migration.applied", from: 1, to: 2 },
+    { event: "schema.migration.start", from: 3, to: 4 },
+    { event: "schema.migration.applied", from: 3, to: 4 },
   ]);
-  await query("UPDATE smart_schema:current SET version = 3;");
+  await query("UPDATE smart_schema:current SET version = 5;");
   await session.reload();
   assert.match(render(), /^🧠 ····  Not set up/);
-  assert.match(render(), /schema 3 is newer than supported schema 2/);
-  assert.ok((await log()).some(({ event, error }) => event === "schema.open_failed" && error.includes("schema 3")));
+  assert.match(render(), /schema 5 is newer than supported schema 4/);
+  assert.ok((await log()).some(({ event, error }) => event === "schema.open_failed" && error.includes("schema 5")));
   await session.prompt("/psm-consolidate global");
   assert.equal(faux.state.callCount, 0);
   assert.deepEqual(await store.read(note.id), note);
+  assert.deepEqual(errors, []);
+});
+
+test("database access switches live, logs calls without leaking SQL by default, and resets on reload", async (t) => {
+  const name = "psm_db_query";
+  let choice;
+  let previousLabel;
+  const { session, faux, store, directory, errors, alerts } = await fixture(t, { select: async (title, options) => {
+    if (title === "Smart Mem settings") {
+      if (!choice) return undefined;
+      previousLabel = options.find((option) => option.startsWith("Database access (this session):"));
+      return previousLabel;
+    }
+    assert.match(title, /Database access for this session/);
+    assert.deepEqual(options, ["Disabled", "Read-only", "Read-write"]);
+    const mode = choice;
+    choice = undefined;
+    return mode;
+  } });
+  const settings = new SettingsFile(directory);
+  await settings.update({ initialMessages: 100, periodicTurns: 100 });
+  const original = session.getActiveToolNames();
+  const settingsPath = join(directory, "settings.json");
+  const persisted = await readFile(settingsPath, "utf8");
+  const setMode = async (mode, previous) => {
+    choice = mode;
+    await session.prompt("/psm-settings");
+    assert.equal(previousLabel, `Database access (this session): ${previous}`);
+    assert.deepEqual(alerts.filter(([, level]) => level === "error"), []);
+    assert.equal(session.getActiveToolNames().includes(name), mode !== "Disabled", JSON.stringify(session.getAllTools().map(({ name }) => name)));
+  };
+  let available;
+  let toolResult;
+  const run = async (query) => {
+    faux.setResponses([({ messages }) => {
+      available = getCurrentTools(messages).map(({ name }) => name);
+      return query ? fauxAssistantMessage(fauxToolCall(name, { query })) : fauxAssistantMessage("No query");
+    }, ({ messages }) => {
+      toolResult = messages.findLast(({ role, toolName }) => role === "toolResult" && toolName === name);
+      return fauxAssistantMessage("Query completed");
+    }]);
+    await session.prompt("Inspect the fixture database");
+    return toolResult;
+  };
+  await run();
+  assert.ok(!available.includes(name));
+  await setMode("Read-only", "Disabled");
+  const selected = await run("SELECT VALUE text FROM memory");
+  assert.ok(available.includes(name));
+  assert.deepEqual(available.filter((tool) => tool !== name).sort(), [...original].sort());
+  assert.deepEqual(JSON.parse(contentText(selected.content)).result, [["Use exit status to verify tests ran"]]);
+  const denied = await run("UPDATE memory SET text = 'Blocked'");
+  assert.equal(denied.isError, true);
+  assert.match(contentText(denied.content), /read-only/);
+  const malformed = (label) => `SELECT VALUE '${label}' FROM`;
+  const quietError = await run(malformed("private-off-sql"));
+  assert.equal(quietError.isError, true);
+  assert.match(contentText(quietError.content), /private-off-sql/);
+
+  await setMode("Read-write", "Read-only");
+  const changed = await run("UPDATE memory SET text = 'Updated' RETURN VALUE text");
+  assert.equal(changed.isError, false);
+  assert.deepEqual(JSON.parse(contentText(changed.content)).result, [["Updated"]]);
+  assert.deepEqual((await store.list("global")).map(({ text }) => text), ["Updated"]);
+  assert.equal(await readFile(settingsPath, "utf8"), persisted);
+  await settings.update({ debugLogging: true });
+  const persistedWithDebug = await readFile(settingsPath, "utf8");
+  const debugSql = "SELECT VALUE text FROM memory";
+  const debugErrorSql = malformed("private-debug-sql");
+  const debugResult = await run(debugSql);
+  const debugError = await run(debugErrorSql);
+  assert.equal(debugError.isError, true);
+  await setMode("Disabled", "Read-write");
+  await run();
+  assert.ok(!available.includes(name));
+  assert.deepEqual(session.getActiveToolNames(), original);
+  await setMode("Read-write", "Disabled");
+  await session.reload();
+  assert.ok(!session.getActiveToolNames().includes(name));
+  await run();
+  assert.ok(!available.includes(name));
+  assert.equal(await readFile(settingsPath, "utf8"), persistedWithDebug);
+  const log = (await readFile(join(directory, "smart-mem.log"), "utf8")).trim().split("\n").map(JSON.parse);
+  assert.deepEqual(log.filter(({ event }) => event === "database.access").map(({ previous, mode }) => [previous, mode]), [
+    ["Disabled", "Read-only"], ["Read-only", "Read-write"], ["Read-write", "Disabled"], ["Disabled", "Read-write"],
+  ]);
+  const audit = log.filter((entry) => entry.name === name);
+  const starts = audit.filter(({ event }) => event === "tool.start");
+  const finishes = audit.filter(({ event }) => event === "tool.finish");
+  assert.deepEqual(starts.map(({ id }) => id), finishes.map(({ id }) => id));
+  assert.deepEqual(finishes.map(({ mode, status }) => [mode, status]), [
+    ["Read-only", "Finished"], ["Read-only", "Failed"], ["Read-only", "Failed"],
+    ["Read-write", "Finished"], ["Read-write", "Finished"], ["Read-write", "Failed"],
+  ]);
+  assert.ok(finishes.every(({ ms }) => Number.isFinite(ms) && ms >= 0));
+  assert.doesNotMatch(JSON.stringify([...starts, ...finishes]), /SELECT|UPDATE|private-|Use exit status|Blocked|Updated/);
+  const requests = audit.filter(({ event }) => event === "database.query.request");
+  const results = audit.filter(({ event }) => event === "database.query.result");
+  assert.deepEqual(requests.map(({ id }) => id), finishes.slice(-2).map(({ id }) => id));
+  assert.deepEqual(requests.map(({ id }) => id), results.map(({ id }) => id));
+  assert.deepEqual(requests.map(({ query }) => query), [debugSql, debugErrorSql]);
+  assert.deepEqual(results.map(({ result }) => result), [contentText(debugResult.content), contentText(debugError.content)]);
+  assert.doesNotMatch(JSON.stringify(log), /private-off-sql/);
   assert.deepEqual(errors, []);
 });
 
@@ -1059,16 +1162,21 @@ test("manual linking, reclassification, and both cleanup passes trace decisions 
   faux.setResponses([fauxAssistantMessage("Ordinary chat response")]);
   await session.prompt("Private linking conversation");
   const unchanged = (name) => fauxAssistantMessage(fauxToolCall(name, name.endsWith("_batch") ? { updates: [] } : { ids: [] }));
+  const vector = { model, values: [1, ...Array(dimensions - 1).fill(0)] };
   const run = async (debugLogging) => {
     await new SettingsFile(directory).update({ debugLogging });
     const malformed = fauxAssistantMessage(fauxToolCall("psm_select_links", { text: "Private invalid decision" }));
-    if (debugLogging) await store.replace(note.id, `${note.text}.`, { model, values: [1, ...Array(dimensions - 1).fill(0)] });
+    if (debugLogging) await store.replace(note.id, `${note.text}.`, vector);
     faux.setResponses([malformed, linkReply()]);
     await session.prompt("/psm-link global");
     faux.setResponses([fauxAssistantMessage(fauxToolCall("psm_reclassify_batch", { updates: [{ id: note.id, kind: debugLogging ? "guideline" : note.kind }] }))]);
     await session.prompt("/psm-reclassify global");
-    faux.setResponses([unchanged("psm_cleanup_guidance_batch"), unchanged("psm_cleanup_memory_conflict"), unchanged("psm_cleanup_memory_conflict")]);
+    const memoryDecision = unchanged("psm_cleanup_memory_conflict");
+    faux.setResponses([unchanged("psm_cleanup_guidance_batch"), memoryDecision, ...debugLogging ? [] : [memoryDecision]]);
     await session.prompt("/psm-cleanup-conflicts");
+    const afterCleanup = faux.state.callCount;
+    await session.prompt("/psm-cleanup-conflicts memory-only");
+    assert.equal(faux.state.callCount, afterCleanup);
     await session.reload();
     return (await readFile(join(directory, "smart-mem.log"), "utf8")).trim().split("\n").map(JSON.parse);
   };
@@ -1087,14 +1195,16 @@ test("manual linking, reclassification, and both cleanup passes trace decisions 
   const requests = decisions.filter(({ event }) => event.endsWith(".request"));
   const responses = decisions.filter(({ event }) => event.endsWith(".response"));
   const results = decisions.filter(({ event }) => event.endsWith(".result"));
-  assert.deepEqual(requests.map(({ tool }) => tool), ["psm_reclassify_batch", "psm_cleanup_guidance_batch", "psm_cleanup_memory_conflict", "psm_cleanup_memory_conflict"]);
+  assert.deepEqual(requests.map(({ tool }) => tool), ["psm_reclassify_batch", "psm_cleanup_guidance_batch", "psm_cleanup_memory_conflict"]);
   assert.ok(requests[0].input.notes.some(({ text }) => text === body));
   assert.ok(requests[1].input.guidance.some(({ text }) => text === guidance));
+  assert.equal(requests[2].input.source.id, note.id);
+  assert.deepEqual(requests[2].input.candidates.map(({ text }) => text), [body]);
   assert.deepEqual(responses.map(({ content }) => content.find(({ type }) => type === "toolCall").name), requests.map(({ tool }) => tool));
   const key = ({ tool, scope, noteIds, attempt }) => ({ tool, scope, noteIds, attempt });
   assert.deepEqual(responses.map(key), requests.map(key));
   assert.deepEqual(results.map(key), requests.map(key));
-  assert.deepEqual(results.map(({ result }) => result.changes), [1, 0, 0, 0]);
+  assert.deepEqual(results.map(({ result }) => result.changes), [1, 0, 0]);
   assert.deepEqual(errors, []);
 });
 

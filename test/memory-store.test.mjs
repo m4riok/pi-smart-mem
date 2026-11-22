@@ -30,8 +30,8 @@ async function fixture(t) {
 test("concurrent opens upgrade an unversioned store once without clearing check markers", async (t) => {
   const { path, store, global } = await fixture(t);
   const queryDb = (sql) => withDatabase(path, false, (db) => db.query(sql).collect());
-  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [2]);
-  await queryDb(`REMOVE TABLE smart_schema; REMOVE FIELD linkChecked ON memory;
+  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [4]);
+  await queryDb(`REMOVE TABLE smart_schema; REMOVE FIELD linkChecked ON memory; REMOVE FIELD conflictChecked ON memory;
     DEFINE FIELD reviewed ON memory TYPE bool DEFAULT false;`);
   const note = await global.add(preference("A checked legacy note"), query);
   const neighbor = await global.add(preference("A legacy neighbor"), query);
@@ -43,14 +43,14 @@ test("concurrent opens upgrade an unversioned store once without clearing check 
   const transitions = [];
   const open = (store) => store.embeddingSpace({ observe: (...event) => transitions.push(event) });
   assert.deepEqual(await Promise.all([open(store), open(global)]), [space, space]);
-  assert.deepEqual(transitions, [["start", 0, 1], ["applied", 0, 1], ["start", 1, 2], ["applied", 1, 2]]);
+  assert.deepEqual(transitions, [["start", 0, 1], ["applied", 0, 1], ["start", 1, 2], ["applied", 1, 2], ["start", 2, 3], ["applied", 2, 3], ["start", 3, 4], ["applied", 3, 4]]);
   assert.deepEqual(await global.read(note.id), note);
   assert.deepEqual(await global.list("global", "unconsolidated"), []);
   assert.deepEqual(new Set((await global.linkingSnapshot("global")).sources), new Set([note, neighbor]));
   assert.deepEqual(await global.related(note.id), [neighbor]);
   assert.deepEqual(await global.related(neighbor.id), [note]);
   assert.equal(await saveEdge(global, neighbor, note), 0);
-  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [2]);
+  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [4]);
 });
 
 test("a failed schema upgrade rolls back its field and version together", async (t) => {
@@ -67,7 +67,23 @@ test("a failed schema upgrade rolls back its field and version together", async 
   assert.equal(version, undefined);
   await queryDb("REMOVE FIELD version ON smart_schema;");
   assert.deepEqual(await store.embeddingSpace({ observe: (...event) => events.push(event) }), space);
-  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [2]);
+  assert.deepEqual(await queryDb("SELECT VALUE version FROM ONLY smart_schema:current;"), [4]);
+});
+
+test("schema 2 upgrade leaves prior checks and links intact while making conflict sources pending", async (t) => {
+  const { path, global } = await fixture(t);
+  const first = await global.add(preference("Run unit tests offline"), query);
+  const second = await global.add(preference("Keep test fixtures local"), query);
+  await global.markConsolidated(first, true);
+  await global.saveLinks([first, second], [{ from: first.id, to: second.id }], [first.id, second.id]);
+  await withDatabase(path, false, (db) => db.query("UPDATE smart_schema:current SET version = 2; REMOVE FIELD conflictChecked ON memory;"));
+  const events = [];
+  await global.embeddingSpace({ observe: (...event) => events.push(event) });
+  assert.deepEqual(events, [["start", 2, 3], ["applied", 2, 3], ["start", 3, 4], ["applied", 3, 4]]);
+  assert.deepEqual(await global.list("global", "unconsolidated"), [second]);
+  assert.deepEqual((await global.linkingSnapshot("global")).sources, []);
+  assert.deepEqual(await global.related(first.id), [second]);
+  assert.deepEqual(new Set(await global.list("global", "unchecked-conflicts")), new Set([first, second]));
 });
 
 test("explicit initialization and durable scoped CRUD", async (t) => {
