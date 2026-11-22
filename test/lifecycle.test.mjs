@@ -15,13 +15,14 @@ import { Archive } from "../src/archive.ts";
 import { withDatabase } from "../src/database.ts";
 import { models } from "../src/embeddings.ts";
 import { createWorkerServer, openWorkerEndpoint } from "../src/embedding-endpoint.ts";
+import { withFileLock } from "../src/file-lock.ts";
 import { MemoryStore } from "../src/memory-store.ts";
 import { resolveProject } from "../src/project.ts";
 import { prompts, SettingsFile } from "../src/settings.ts";
 
 const hermesNames = ["memory_add", "memory_replace", "memory_remove", "session_search", "memory_search"];
 
-async function fixture(t, { child = false, setup = false, empty = false, hermes = false, mode = "rpc", setWidget = () => {}, select, custom, confirm = false, fauxModels, beforeBind } = {}) {
+async function fixture(t, { child = false, setup = false, empty = false, hermes = false, mode = "rpc", setWidget = () => {}, select, custom, confirm = false, fauxModels, beforeBind, nativeWorker = false } = {}) {
   const cwd = await mkdtemp(join(tmpdir(), "smart-mem-pi-"));
   const agentDir = join(cwd, "agent");
   const directory = join(agentDir, "pi-smart-mem");
@@ -32,6 +33,12 @@ async function fixture(t, { child = false, setup = false, empty = false, hermes 
     if (boundSession) {
       await boundSession.extensionRunner.emit({ type: "session_shutdown", reason: "reload" });
       boundSession.dispose();
+    }
+    if (nativeWorker) {
+      const logPath = join(directory, "smart-mem.log");
+      await waitFor(async () => (await readFile(logPath, "utf8")).includes('"event":"worker.exit"'), "the embedding worker's final diagnostic");
+      // The exit entry is visible before its writer releases the log lock.
+      await withFileLock(`${logPath}.lock`, async () => {});
     }
     await rm(cwd, { recursive: true, force: true });
   });
@@ -153,7 +160,7 @@ async function waitFor(check, description) {
 const waitForReviews = (manager, count) => waitFor(() => rows(manager).length >= count, `${count} review rows`);
 
 test("unconfigured startup warns without opening the picker; setup command asks before creating storage", async (t) => {
-  const { session, dialogs, directory, alerts, errors, faux } = await fixture(t, { setup: true });
+  const { session, dialogs, directory, alerts, errors, faux } = await fixture(t, { setup: true, nativeWorker: true });
   assert.deepEqual(session.extensionRunner.getRegisteredCommands().map(({ name }) => name).sort(), [
     "psm-cleanup-conflicts", "psm-consolidate", "psm-inject", "psm-link", "psm-migrate-hermes", "psm-pin", "psm-reclassify", "psm-settings", "psm-setup",
   ]);
