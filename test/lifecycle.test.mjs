@@ -616,18 +616,29 @@ test("explicit review waits for a foreground save and sees its confirmed result"
 test("foreground receives skill guidance and can choose project or global scope", async (t) => {
   const { session, archive, faux, errors, directory, cwd, sessionManager } = await fixture(t);
   const file = new SettingsFile(directory);
+  await file.update({ prompts: { recall: undefined } });
   const draft = (scope) => ({ scope, name: `${scope} fixture`, description: "Run regression fixtures", text: "Create isolated fixtures before testing." });
   faux.setResponses([
     (ctx) => {
-      assert.match(getCurrentSystemPrompt(ctx.messages), /Before saving, use psm_skill_search/);
-      const names = getCurrentTools(ctx.messages).map((tool) => tool.name);
-      for (const name of ["psm_skill_search", "psm_skill_read", "psm_skill_save"]) assert.ok(names.includes(name));
+      const system = getCurrentSystemPrompt(ctx.messages);
+      assert.match(system, /Before working out a procedure from scratch, search for a relevant skill with psm_skill_search/);
+      assert.match(system, /Read promising matches with psm_skill_read and use the steps that fit/);
+      assert.match(system, /proactively save or improve a skill when trial and error yields a repeatable workflow/);
+      assert.match(system, /Before saving, use psm_skill_search/);
+      assert.match(system, /Skip if already covered; revise a matching same-scope skill/);
+      const descriptions = new Map(getCurrentTools(ctx.messages).map(({ name, description }) => [name, description]));
+      assert.match(descriptions.get("psm_skill_search"), /before working one out from scratch or saving a new skill/);
+      assert.match(descriptions.get("psm_skill_read"), /reuse its steps/);
+      assert.match(descriptions.get("psm_skill_save"), /genuinely repeatable procedure.*psm_skill_search first/);
       return fauxAssistantMessage(fauxToolCall("psm_skill_save", draft("project")));
     },
     fauxAssistantMessage("Saved project fixture skill"),
     (ctx) => {
-      assert.match(getCurrentSystemPrompt(ctx.messages), /Skill guidance override fixture/);
-      assert.doesNotMatch(getCurrentSystemPrompt(ctx.messages), /Before saving, use psm_skill_search/);
+      const system = getCurrentSystemPrompt(ctx.messages);
+      assert.match(system, /Skill guidance override fixture/);
+      assert.match(system, /Before working out a procedure from scratch, search for a relevant skill with psm_skill_search/);
+      assert.doesNotMatch(system, /proactively save or improve a skill/);
+      assert.doesNotMatch(system, /Before saving, use psm_skill_search/);
       return fauxAssistantMessage(fauxToolCall("psm_skill_save", draft("global")));
     },
     fauxAssistantMessage("Saved global fixture skill"),

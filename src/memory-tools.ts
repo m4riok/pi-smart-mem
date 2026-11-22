@@ -74,9 +74,9 @@ export function memoryTools(getStore: () => MemoryStore, getArchive: () => Archi
     }),
     operation(toolNames.memoryRelated, "Find one hop of stored graph neighbors from a saved memory.", Type.Object({ id }), ({ id }) => output(getStore().related(id))),
     operation(toolNames.memoryGlobalPreferences, "Find global user preferences semantically related to a project memory.", Type.Object({ id, limit }), ({ id, limit }) => output(getStore().relatedGlobalPreferences(id, limit ?? 5))),
-    operation(toolNames.skillSearch, "Find stored reusable procedures by name or description.", Type.Object({ query: Type.String(), scope: Type.Optional(scope) }), ({ query, scope }) => output(getArchive().searchSkills(query, scope))),
-    operation(toolNames.skillRead, "Read a stored reusable procedure by ID.", Type.Object({ id }), ({ id }) => output(getArchive().readSkill(id))),
-    operation(toolNames.skillSave, "Save a reusable procedure or revise a procedure in the same scope using its ID.", Type.Object({ id: Type.Optional(id), name: text, description: text, text, scope }), async ({ id, ...draft }, signal) => {
+    operation(toolNames.skillSearch, "Find reusable procedures by name or description before working one out from scratch or saving a new skill.", Type.Object({ query: Type.String(), scope: Type.Optional(scope) }), ({ query, scope }) => output(getArchive().searchSkills(query, scope))),
+    operation(toolNames.skillRead, "Read a matching skill by ID to reuse its steps or check whether it already covers the procedure.", Type.Object({ id }), ({ id }) => output(getArchive().readSkill(id))),
+    operation(toolNames.skillSave, `Save a genuinely repeatable procedure. Check for existing skills with ${toolNames.skillSearch} first; pass a same-scope skill's ID to improve it instead of creating a duplicate.`, Type.Object({ id: Type.Optional(id), name: text, description: text, text, scope }), async ({ id, ...draft }, signal) => {
       const value = await getArchive().saveSkill(draft, id, signal);
       return { value, saved: !!value };
     }),
