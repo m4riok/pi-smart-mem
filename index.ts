@@ -27,6 +27,7 @@ import { SharedEmbeddings } from "./src/shared-embeddings.ts";
 
 const injectedType = "smart-mem-injection";
 const initialType = "smart-mem-initial";
+const injectionTitle = "Selecting relevant memories";
 const statusKey = "smart-mem";
 
 const isConversation = ({ role }: { role: string }) => role === "user" || role === "assistant";
@@ -75,6 +76,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
   let turns = 0;
   let calls = 0;
   let initial = false;
+  let initialPending = false;
   let indexed = 0;
   const panel = new MemoryPanel();
   const toolActivity = new Map<string, Activity>();
@@ -289,13 +291,30 @@ export default function smartMemory(pi: ExtensionAPI): void {
     return [...lastContext.actual, ...messages.slice(before.length)];
   }
 
-  async function inject(ctx: ExtensionContext, settings: Settings, messages: Message[]) {
-    const action = () => selectInjection(ctx, settings, messages);
-    if (!hasPanel(ctx)) return action();
-    return progress(ctx, "Selecting relevant memories", action);
+  function injectionModelContext(ctx: ExtensionContext): ModelContext {
+    const systemPrompt = ctx.getSystemPrompt();
+    return { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel, getSystemPrompt: () => systemPrompt };
   }
 
-  async function selectInjection(ctx: ExtensionContext, settings: Settings, messages: Message[], manual?: { modelContext: ModelContext; signal: AbortSignal }) {
+  function queueInjection(ctx: ExtensionContext, settings: Settings, messages: Message[], trigger: "initial" | "compaction") {
+    const modelContext = injectionModelContext(ctx);
+    if (trigger === "initial") initialPending = true;
+    void jobs.enqueue({ title: injectionTitle, run: async (signal) => {
+      try {
+        const addition = await progress(ctx, injectionTitle, () => selectInjection(ctx, settings, messages, { modelContext, signal }));
+        signal.throwIfAborted();
+        if (trigger === "initial") {
+          pi.appendEntry(initialType);
+          initial = true;
+        }
+        if (addition) pi.sendMessage(addition, { triggerTurn: false });
+      } finally {
+        if (trigger === "initial") initialPending = false;
+      }
+    } });
+  }
+
+  async function selectInjection(ctx: ExtensionContext, settings: Settings, messages: Message[], queued?: { modelContext: ModelContext; signal: AbortSignal; manual?: true }) {
     const ids: string[] = [];
     let submitted = false;
     const available = tools.filter(({ name }) => lookupNames.includes(name));
@@ -304,17 +323,17 @@ export default function smartMemory(pi: ExtensionAPI): void {
       return { value: { selected: ids.length } };
     });
     const task = [prompt(settings, "precedence"), prompt(settings, "injection")].join("\n\n");
-    const report = await runModel(manual?.modelContext ?? ctx, messages, task, [...available, selection], { settings, signal: manual?.signal ?? ctx.signal, done: () => submitted });
-    if (!submitted || (manual && !ids.length)) {
+    const report = await runModel(queued?.modelContext ?? ctx, messages, task, [...available, selection], { settings, signal: queued?.signal ?? ctx.signal, done: () => submitted });
+    if (!submitted || (queued?.manual && !ids.length)) {
       const failure = report.calls.find(({ isError }) => isError);
       if (failure) throw new Error(`${failure.name}: ${String(failure.result).split("\n\nReceived arguments:\n", 1)[0]}`);
     }
-    const notes = await getStore().readMany(ids, manual?.signal);
-    manual?.signal.throwIfAborted();
+    const notes = await getStore().readMany(ids, queued?.signal);
+    queued?.signal.throwIfAborted();
     const { kept, overflow } = injectionText(notes.map(({ text }) => text));
     if (overflow) notify(ctx, "Memory injection exceeded 32 KiB. Remaining notes were not injected.", "warning");
-    else if (hasPanel(ctx) && (kept.length || !manual)) panel.notice(kept.length ? `Injected ${kept.length} saved ${kept.length === 1 ? "memory" : "memories"}` : "No relevant memories selected");
-    void log.write("injection.finish", { selected: kept.length, overflow, manual: manual ? true : undefined, submitted });
+    else if (hasPanel(ctx) && (kept.length || !queued?.manual)) panel.notice(kept.length ? `Injected ${kept.length} saved ${kept.length === 1 ? "memory" : "memories"}` : "No relevant memories selected");
+    void log.write("injection.finish", { selected: kept.length, overflow, manual: queued?.manual, submitted });
     if (!kept.length) return undefined;
     return { customType: injectedType, content: `${prompt(settings, "injected")}\n\n${kept.join("\n\n")}`, display: false };
   }
@@ -533,13 +552,18 @@ export default function smartMemory(pi: ExtensionAPI): void {
     if (!activePreset) return;
     turns++;
     if (event.message.role === "assistant") calls += event.message.content.filter((part) => part.type === "toolCall").length;
-    if (initial || ctx.signal?.aborted) return;
+    if (initial || initialPending || ctx.signal?.aborted) return;
     const entries = [];
     try {
       const settings = await file.read();
       const chat = ctx.sessionManager.getBranch().filter((entry) => entry.type === "message" && isConversation(entry.message));
       if (chat.length >= settings.initialMessages && !ctx.signal?.aborted) {
-        const addition = await inject(ctx, settings, withActiveContext(event.context.llmMessages));
+        const messages = withActiveContext(event.context.llmMessages);
+        if (ctx.mode === "tui") {
+          queueInjection(ctx, settings, messages, "initial");
+          return;
+        }
+        const addition = await selectInjection(ctx, settings, messages);
         ctx.signal?.throwIfAborted();
         initial = true;
         entries.push({ type: "custom" as const, customType: initialType });
@@ -558,7 +582,13 @@ export default function smartMemory(pi: ExtensionAPI): void {
     lastContext = undefined;
     if (!activePreset || !ctx.sessionManager.getEntries().some((e) => e.type === "custom_message" && e.customType === injectedType)) return;
     try {
-      const addition = await inject(ctx, await file.read(), projected(ctx));
+      const settings = await file.read();
+      const messages = projected(ctx);
+      if (ctx.mode === "tui") {
+        queueInjection(ctx, settings, messages, "compaction");
+        return;
+      }
+      const addition = await selectInjection(ctx, settings, messages);
       if (addition) pi.sendMessage(addition, { triggerTurn: false });
     } catch (error) { reportError(ctx, error); }
   });
@@ -723,15 +753,13 @@ export default function smartMemory(pi: ExtensionAPI): void {
       const background = ctx.mode === "tui";
       await runManualJob(ctx, background ? "background" : "queued-response", () => {
         getStore();
-        const title = "Selecting relevant memories";
         const messages = withActiveContext(projected(ctx));
-        const systemPrompt = ctx.getSystemPrompt();
-        const modelContext: ModelContext = { model: ctx.model, modelRegistry: ctx.modelRegistry, thinkingLevel: ctx.thinkingLevel, getSystemPrompt: () => systemPrompt };
+        const modelContext = injectionModelContext(ctx);
         return {
-          kind: "inject", title,
+          kind: "inject", title: injectionTitle,
           run: async (_report, signal) => {
-            if (background) void log.write("operation.start", { title });
-            return selectInjection(ctx, await file.read(), messages, { modelContext, signal });
+            if (background) void log.write("operation.start", { title: injectionTitle });
+            return selectInjection(ctx, await file.read(), messages, { modelContext, signal, manual: true });
           },
           complete: (addition) => {
             if (addition) pi.sendMessage(addition, { triggerTurn: false });

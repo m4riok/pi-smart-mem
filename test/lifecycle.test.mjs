@@ -525,6 +525,44 @@ test("Pi runs user-triggered and periodic reviews and adds independent, repeatab
   assert.deepEqual(alerts.filter(([, level]) => level === "error"), []);
 });
 
+test("interactive initial injection lets chat continue and delivers memories once ready", { timeout: 10000 }, async (t) => {
+  const { session, note, faux, directory, sessionManager, errors } = await fixture(t, { mode: "tui" });
+  await new SettingsFile(directory).update({ initialMessages: 2, periodicTurns: 100 });
+  const selection = Promise.withResolvers();
+  const selected = fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [note.id] }));
+  let selectorInput;
+  let inFlightInput;
+  let nextInput;
+  faux.setResponses([
+    fauxAssistantMessage("First answer"),
+    ({ messages }) => { selectorInput = text(messages); return selection.promise; },
+    ({ messages }) => { inFlightInput = text(messages); return fauxAssistantMessage("Answer while selecting"); },
+    ({ messages }) => { nextInput = text(messages); return fauxAssistantMessage("Answer with injected context"); },
+  ]);
+  let firstSettled = false;
+  const first = session.prompt("Start the fixture");
+  void first.then(() => { firstSettled = true; }, () => { firstSettled = true; });
+  try {
+    await waitFor(() => selectorInput !== undefined && firstSettled, "chat to settle while initial selection is pending");
+    await first;
+    assert.match(selectorInput, /Start the fixture/);
+    await session.prompt("Keep chatting while selection runs");
+    assert.ok(!inFlightInput.includes(note.text));
+    assert.equal(injections(sessionManager).length, 0);
+    assert.equal(faux.state.callCount, 3);
+    selection.resolve(selected);
+    await waitFor(() => injections(sessionManager).length === 1, "initial memory to be injected");
+    assert.equal(faux.state.callCount, 3, "injection must not start a reply");
+    await session.prompt("Continue with the selected memory");
+    assert.ok(nextInput.includes(note.text));
+    assert.equal(faux.state.callCount, 4, "initial injection must not repeat");
+    assert.deepEqual(errors, []);
+  } finally {
+    selection.resolve(selected);
+    await first;
+  }
+});
+
 test("interactive manual injection shares the review queue without blocking chat", { timeout: 10000 }, async (t) => {
   let panel;
   const { session, note, faux, directory, sessionManager, errors } = await fixture(t, { mode: "tui", setWidget: (key, build) => {
@@ -1652,7 +1690,65 @@ test("split linking batches retry failures, keep incomplete sources pending, and
   assert.deepEqual(errors, []);
 });
 
-test("compaction and injection refresh finish while a pre-compaction review is still running", { timeout: 10000 }, async (t) => {
+test("interactive compaction refresh queues behind review without blocking chat", { timeout: 10000 }, async (t) => {
+  const { session, note, faux, directory, sessionManager, store, errors } = await fixture(t, { mode: "tui" });
+  await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
+  const { model, dimensions } = models[0];
+  const refreshed = await store.add({ scope: "global", kind: "note", text: "Memory selected from the compacted context" }, { model, values: [1, ...Array(dimensions - 1).fill(0)] });
+  faux.setResponses(Array.from({ length: 6 }, (_, i) => fauxAssistantMessage(`Assistant text ${i}`)));
+  for (let i = 0; i < 6; i++) await session.prompt(`User text ${i}`);
+  faux.appendResponses([fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [note.id] }))]);
+  await session.prompt("/psm-inject");
+  await waitFor(() => injections(sessionManager).length === 1, "previous injection");
+
+  const review = Promise.withResolvers();
+  const selection = Promise.withResolvers();
+  const reviewDone = fauxAssistantMessage("Nothing durable for memory");
+  const selected = fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [refreshed.id] }));
+  let refreshInput;
+  let inFlightInput;
+  let nextInput;
+  try {
+    faux.appendResponses([
+      (ctx) => {
+        assert.match(getCurrentSystemPrompt(ctx.messages), /Before this context boundary/);
+        return review.promise;
+      },
+      fauxAssistantMessage("Fixture summary of earlier conversation"),
+      fauxAssistantMessage("Answer before refresh starts"),
+      (ctx) => {
+        assert.match(getCurrentSystemPrompt(ctx.messages), /Injection task fixture/);
+        refreshInput = text(ctx.messages);
+        return selection.promise;
+      },
+      ({ messages }) => { inFlightInput = text(messages); return fauxAssistantMessage("Answer during refresh"); },
+      ({ messages }) => { nextInput = text(messages); return fauxAssistantMessage("Answer with refreshed context"); },
+    ]);
+    await session.compact();
+    assert.deepEqual(rows(sessionManager), []);
+    await session.prompt("Chat before refresh starts");
+    assert.equal(refreshInput, undefined);
+    review.resolve(reviewDone);
+    await waitFor(() => refreshInput !== undefined, "queued refresh to start");
+    assert.match(refreshInput, /Fixture summary of earlier conversation/);
+    assert.doesNotMatch(refreshInput, /Chat before refresh starts/);
+    await session.prompt("Chat while refresh is running");
+    assert.ok(!inFlightInput.includes(refreshed.text));
+    assert.equal(injections(sessionManager).length, 1);
+    const calls = faux.state.callCount;
+    selection.resolve(selected);
+    await waitFor(() => injections(sessionManager).length === 2, "compaction refresh to be injected");
+    assert.equal(faux.state.callCount, calls, "refresh must not start a reply");
+    await session.prompt("Continue after refresh");
+    assert.ok(nextInput.includes(refreshed.text));
+    assert.deepEqual(errors, []);
+  } finally {
+    review.resolve(reviewDone);
+    selection.resolve(selected);
+  }
+});
+
+test("non-interactive compaction waits for refresh but not for its pre-compaction review", { timeout: 10000 }, async (t) => {
   const { session, note, faux, directory, errors, alerts, sessionManager } = await fixture(t);
   await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
   faux.setResponses(Array.from({ length: 6 }, (_, i) => fauxAssistantMessage(`Assistant text ${i}`)));
