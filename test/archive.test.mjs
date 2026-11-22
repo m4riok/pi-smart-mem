@@ -32,6 +32,20 @@ test("pins and reusable skills respect repo and global scopes across connections
   assert.equal((await a.saveSkill({ ...data, scope: "project", text: "Run the extended verification fixture" }, local.id)).text, "Run the extended verification fixture");
 });
 
+test("skill search ranks keyword matches across name and description within scope", async (t) => {
+  const { a, b, global } = await fixture(t);
+  const text = "Run the release deploy procedure";
+  const phrase = await a.saveSkill({ name: "Z Release deploy guide", description: "Production checklist", text, scope: "project" });
+  const reordered = await global.saveSkill({ name: "Deploy and release procedure", description: "Production checklist", text, scope: "global" });
+  const sharedFields = await a.saveSkill({ name: "A Release checklist", description: "How to deploy safely", text, scope: "project" });
+  await a.saveSkill({ name: "Deployment", description: "Release planning only", text, scope: "project" });
+  await b.saveSkill({ name: "Release deploy", description: "Other project", text, scope: "project" });
+
+  assert.deepEqual(await a.searchSkills("RELEASE deploy"), [phrase, reordered, sharedFields].map(({ id, name, description, scope }) => ({ id, name, description, scope })));
+  assert.deepEqual((await a.searchSkills("release deploy", "project")).map(({ id }) => id), [phrase.id, sharedFields.id]);
+  assert.deepEqual((await a.searchSkills("deploy and rel")).map(({ id }) => id), [reordered.id]);
+});
+
 test("pin removal targets one record and respects current project and global scope", async (t) => {
   const { a, b, global } = await fixture(t);
   const text = "Shared pin wording";

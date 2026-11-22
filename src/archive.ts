@@ -15,13 +15,15 @@ export function contentText(content: unknown): string {
 export type Pin = { id: RecordId<"smart_pin">; scope: Scope; text: string };
 type PinRow = Pick<Pin, "id" | "text"> & { project?: string };
 type SkillDraft = { name: string; description: string; text: string; scope: Scope };
-type SkillRow = Omit<SkillDraft, "scope"> & { id: RecordId<"smart_skill", string>; project?: string };
+type SkillSummaryRow = Pick<SkillDraft, "name" | "description"> & { id: RecordId<"smart_skill", string>; project?: string };
+type SkillRow = SkillSummaryRow & Pick<SkillDraft, "text">;
 export const transcriptRoles = ["user", "assistant"] as const;
 type TranscriptPart = { entry: string; role: typeof transcriptRoles[number]; text: string; timestamp: string };
 type TranscriptSearch = { exclude?: string; project?: string; role?: TranscriptPart["role"] };
 const inScope = "(project = NONE OR ($project != NONE AND project = $project))";
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
-const skill = ({ id, project, ...row }: SkillRow) => ({ ...row, id: id.id, scope: project === undefined ? "Global" : "Project" });
+const skill = <T extends SkillSummaryRow>({ id, project, ...row }: T) => ({ ...row, id: id.id, scope: project === undefined ? "Global" : "Project" });
+const skillWords = (value: string) => value.match(/[\p{L}\p{M}\p{N}]+/gu) ?? [];
 
 export function transcriptParts(entries: FileEntry[]): TranscriptPart[] {
   const parts: TranscriptPart[] = [];
@@ -84,12 +86,23 @@ export class Archive {
 
   async searchSkills(query: string, scope?: Scope) {
     const filter = scope === "project" ? "($project != NONE AND project = $project)" : scope === "global" ? "project = NONE" : inScope;
-    return withDatabase(this.#path, false, async (db) => {
-      const [rows] = await db.query<[SkillRow[]]>(`SELECT id, name, description, project FROM smart_skill WHERE ${filter}
-        AND (string::contains(string::lowercase(name), $query) OR string::contains(string::lowercase(description), $query)) ORDER BY name LIMIT 20`,
-      { project: this.#project, query: query.toLowerCase() });
-      return rows.map(skill);
-    });
+    const [rows] = await withDatabase(this.#path, false, (db) => db.query<[SkillSummaryRow[]]>(
+      `SELECT id, name, description, project FROM smart_skill WHERE ${filter} ORDER BY name`, { project: this.#project }));
+    const needle = query.toLowerCase();
+    const terms = [...new Set(skillWords(needle))];
+    return rows.flatMap((row) => {
+      const name = row.name.toLowerCase();
+      const description = row.description.toLowerCase();
+      const literal = name.includes(needle) || description.includes(needle);
+      const nameWords = new Set(skillWords(name));
+      const missing = terms.filter((term) => !nameWords.has(term));
+      if (!literal) {
+        const descriptionWords = new Set(skillWords(description));
+        if (!terms.length || missing.some((term) => !descriptionWords.has(term))) return [];
+      }
+      return [{ row, literal, nameHits: terms.length - missing.length }];
+    }).sort((a, b) => Number(b.literal) - Number(a.literal) || b.nameHits - a.nameHits)
+      .slice(0, 20).map(({ row }) => skill(row));
   }
 
   async readSkill(id: string) {
