@@ -1727,7 +1727,9 @@ test("recall explains weight and initial injection can follow stored links for m
     assert.match(guidance, /Weight does not override current instructions, project applicability, or newer evidence/);
   }
   assert.match(selection, /If the initial results leave a context gap, call psm_memory_related with a promising memory's ID/);
-  assert.match(selection, /From both search hits and linked notes, select only what is useful now/);
+  assert.match(selection, /Always finish by calling psm_select_memories with the selected IDs/);
+  assert.match(selection, /If no memories are relevant, you must still call psm_select_memories with \{"ids":\[\]\}/);
+  assert.match(selection, /Do not substitute a prose reply for this tool call/);
   assert.equal(JSON.parse(contentText(retrieved.content)).result.weight, 1);
   assert.deepEqual(JSON.parse(contentText(neighbors.content)).result.map(({ id }) => id), [linked.id]);
   assert.deepEqual(injections(sessionManager).map(({ content }) => content), [`${prompts.injected}\n\n${linked.text}`]);
@@ -1736,25 +1738,32 @@ test("recall explains weight and initial injection can follow stored links for m
   assert.deepEqual(errors, []);
 });
 
-test("failed initial selection retries; a valid empty selection consumes the trigger", async (t) => {
-  const { session, faux, directory, sessionManager } = await fixture(t);
+test("failed initial selection retries; prose without a selection counts as zero memories", async (t) => {
+  const { session, faux, directory, sessionManager, alerts } = await fixture(t);
   await new SettingsFile(directory).update({ initialMessages: 2, periodicTurns: 100 });
   const marker = () => sessionManager.getEntries().filter((entry) => entry.type === "custom" && entry.customType === "smart-mem-initial");
   faux.setResponses([
     fauxAssistantMessage("First answer"),
-    fauxAssistantMessage("Did not select"),
+    fauxAssistantMessage(fauxToolCall("psm_memory_search", {})),
+    fauxAssistantMessage("Search failed"),
     fauxAssistantMessage("Second answer"),
-    fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [] })),
+    fauxAssistantMessage("No relevant memories found"),
     fauxAssistantMessage("Third answer"),
   ]);
+  const failures = () => alerts.filter(([, level]) => level === "error");
   await session.prompt("First turn");
   assert.equal(marker().length, 0);
+  assert.equal(failures().length, 1);
+  assert.match(failures()[0][0], /psm_memory_search.*query/s);
   await session.prompt("Second turn");
   assert.equal(marker().length, 1);
+  assert.equal(failures().length, 1);
   await session.prompt("Third turn");
   assert.equal(marker().length, 1);
   assert.equal(injections(sessionManager).length, 0);
-  assert.equal(faux.state.callCount, 5);
+  assert.equal(faux.state.callCount, 6);
+  const log = async () => (await readFile(join(directory, "smart-mem.log"), "utf8")).trim().split("\n").map(JSON.parse);
+  await waitFor(async () => (await log()).some(({ event, selected, submitted }) => event === "injection.finish" && selected === 0 && submitted === false), "empty selection diagnostics");
 });
 
 test("timed-out pre-compaction review cannot block a later review or start a write", async (t) => {

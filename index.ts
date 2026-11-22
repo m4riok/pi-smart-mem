@@ -299,17 +299,16 @@ export default function smartMemory(pi: ExtensionAPI): void {
     });
     const task = [prompt(settings, "precedence"), prompt(settings, "injection")].join("\n\n");
     const report = await runModel(manual?.modelContext ?? ctx, messages, task, [...available, selection], { settings, signal: manual?.signal ?? ctx.signal, done: () => submitted });
-    if (manual && !ids.length) {
+    if (!submitted || (manual && !ids.length)) {
       const failure = report.calls.find(({ isError }) => isError);
       if (failure) throw new Error(`${failure.name}: ${String(failure.result).split("\n\nReceived arguments:\n", 1)[0]}`);
     }
-    if (!manual && !submitted) throw new Error("Model did not submit a memory selection");
     const notes = await getStore().readMany(ids, manual?.signal);
     manual?.signal.throwIfAborted();
     const { kept, overflow } = injectionText(notes.map(({ text }) => text));
     if (overflow) notify(ctx, "Memory injection exceeded 32 KiB. Remaining notes were not injected.", "warning");
     else if (hasPanel(ctx) && (kept.length || !manual)) panel.notice(kept.length ? `Injected ${kept.length} saved ${kept.length === 1 ? "memory" : "memories"}` : "No relevant memories selected");
-    void log.write("injection.finish", { selected: kept.length, overflow, manual: manual ? true : undefined });
+    void log.write("injection.finish", { selected: kept.length, overflow, manual: manual ? true : undefined, submitted });
     if (!kept.length) return undefined;
     return { customType: injectedType, content: `${prompt(settings, "injected")}\n\n${kept.join("\n\n")}`, display: false };
   }
