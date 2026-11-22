@@ -32,14 +32,20 @@ test("pins and reusable skills respect repo and global scopes across connections
   assert.equal((await a.saveSkill({ ...data, scope: "project", text: "Run the extended verification fixture" }, local.id)).text, "Run the extended verification fixture");
 });
 
-test("backfill is idempotent and prune never writes original Pi transcripts", async (t) => {
+test("backfill skips subagent artifacts, is idempotent, and leaves originals untouched", async (t) => {
   const { root, a } = await fixture(t);
   const directory = join(root, "sessions");
-  const session = SessionManager.create(root, directory);
+  const projectSessions = join(directory, "--fixture--");
+  const session = SessionManager.create(root, projectSessions);
   session.appendMessage({ role: "user", content: "Historical unicorn detail", timestamp: Date.now() });
   session.appendMessage({ role: "assistant", content: [{ type: "text", text: "Acknowledged" }], api: "fixture", provider: "fixture", model: "fixture", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() });
   const path = session.getSessionFile();
   const original = await readFile(path);
+  const artifacts = join(projectSessions, "subagent-artifacts");
+  const artifactPath = join(artifacts, "fixture_general_transcript.jsonl");
+  const artifact = JSON.stringify({ version: 1, recordType: "message", role: "assistant", text: "Internal artifact" });
+  await mkdir(artifacts);
+  await writeFile(artifactPath, artifact);
   assert.equal(await a.backfill(directory, () => {}), 1);
   assert.equal(await a.backfill(directory, () => {}), 1);
   const matches = await a.searchTranscripts("unicorn");
@@ -50,6 +56,16 @@ test("backfill is idempotent and prune never writes original Pi transcripts", as
   await a.prune();
   assert.deepEqual(await a.searchTranscripts("unicorn"), []);
   assert.deepEqual(await readFile(path), original);
+  assert.equal(await readFile(artifactPath, "utf8"), artifact);
+});
+
+test("backfill reports a session file missing its Pi header", async (t) => {
+  const { root, a } = await fixture(t);
+  const directory = join(root, "sessions");
+  const path = join(directory, "broken.jsonl");
+  await mkdir(directory);
+  await writeFile(path, JSON.stringify({ type: "message", id: "fixture", message: { role: "user", content: "Missing header" } }));
+  await assert.rejects(a.backfill(directory, () => {}), { message: `Not a Pi transcript: ${path}` });
 });
 
 test("transcript search filters by exact working directory and author independently or together", async (t) => {

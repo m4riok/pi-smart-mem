@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { type FileEntry, parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import { RecordId } from "surrealdb";
 import { withDatabase } from "./database.ts";
@@ -118,7 +118,10 @@ export class Archive {
 
   async backfill(root: string, progress: (message: string) => void) {
     const files = await readdir(root, { recursive: true, withFileTypes: true });
-    const paths = files.filter((file) => file.isFile() && file.name.endsWith(".jsonl")).map((file) => join(file.parentPath, file.name));
+    // pi-subagents writes JSONL artifacts alongside native Pi sessions, but they have no session header.
+    const paths = files.filter((file) => file.isFile() && file.name.endsWith(".jsonl")
+      && !relative(root, file.parentPath).split(sep).includes("subagent-artifacts"))
+      .map((file) => join(file.parentPath, file.name));
     for (const [i, path] of paths.entries()) {
       progress(`Indexing Pi session ${i + 1}/${paths.length}`);
       await this.index(path, parseSessionEntries(await readFile(path, "utf8")));
