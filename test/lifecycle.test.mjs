@@ -1591,6 +1591,52 @@ test("compaction and injection refresh finish while a pre-compaction review is s
   assert.deepEqual(alerts.filter(([, level]) => level === "error"), []);
 });
 
+test("recall explains weight and initial injection can follow stored links for missing context", async (t) => {
+  const { session, faux, directory, sessionManager, store, note, errors } = await fixture(t);
+  const { model, dimensions } = models[0];
+  const linked = await store.add({ scope: "global", kind: "preference", text: "Run regression tests against isolated fixtures" }, { model, values: [1, ...Array(dimensions - 1).fill(0)] });
+  await store.saveLinks([note, linked], [linkPair(note, linked)], []);
+  await store.reinforce(note.id, "fixture-verified-recurrence");
+  await new SettingsFile(directory).update({ initialMessages: 2, periodicTurns: 100, prompts: { recall: undefined, injection: undefined } });
+  let foreground;
+  let selection;
+  let retrieved;
+  let neighbors;
+  faux.setResponses([
+    ({ messages }) => {
+      foreground = getCurrentSystemPrompt(messages);
+      return fauxAssistantMessage("Fixture answer");
+    },
+    ({ messages }) => {
+      selection = messages.find(({ role }) => role === "system")?.sections?.["smart-mem-task"];
+      return fauxAssistantMessage(fauxToolCall("psm_memory_read", { id: note.id }));
+    },
+    ({ messages }) => {
+      retrieved = messages.findLast(({ role, toolName }) => role === "toolResult" && toolName === "psm_memory_read");
+      return fauxAssistantMessage(fauxToolCall("psm_memory_related", { id: note.id }));
+    },
+    ({ messages }) => {
+      neighbors = messages.findLast(({ role, toolName }) => role === "toolResult" && toolName === "psm_memory_related");
+      return fauxAssistantMessage(fauxToolCall("psm_select_memories", { ids: [linked.id] }));
+    },
+  ]);
+  await session.prompt("Apply the relevant testing guidance for fixture isolation");
+  for (const guidance of [foreground, selection]) {
+    assert.match(guidance, /Positive memory weight is evidence of a recurring issue or situation/);
+    assert.match(guidance, /Zero means no reinforcement was recorded/);
+    assert.match(guidance, /Prefer higher weight only between similarly relevant and applicable memories/);
+    assert.match(guidance, /Weight does not override current instructions, project applicability, or newer evidence/);
+  }
+  assert.match(selection, /If the initial results leave a context gap, call psm_memory_related with a promising memory's ID/);
+  assert.match(selection, /From both search hits and linked notes, select only what is useful now/);
+  assert.equal(JSON.parse(contentText(retrieved.content)).result.weight, 1);
+  assert.deepEqual(JSON.parse(contentText(neighbors.content)).result.map(({ id }) => id), [linked.id]);
+  assert.deepEqual(injections(sessionManager).map(({ content }) => content), [`${prompts.injected}\n\n${linked.text}`]);
+  assert.equal((await store.read(note.id)).weight, 1);
+  assert.equal((await store.read(linked.id)).weight, 0);
+  assert.deepEqual(errors, []);
+});
+
 test("failed initial selection retries; a valid empty selection consumes the trigger", async (t) => {
   const { session, faux, directory, sessionManager } = await fixture(t);
   await new SettingsFile(directory).update({ initialMessages: 2, periodicTurns: 100 });
