@@ -15,16 +15,24 @@ test("file lock excludes independent processes, cancels waiting, and releases on
   const child = spawn(process.execPath, ["--input-type=module", "-e", `
     import { withFileLock } from ${JSON.stringify(moduleUrl)};
     await withFileLock(process.argv[1], async () => {
+      setInterval(() => {}, 1000);
       process.stdout.write("ready");
-      process.stdin.resume();
       await new Promise(() => {});
     });
-  `, path], { stdio: ["pipe", "pipe", "inherit"] });
-  const exit = once(child, "close");
+  `, path], { stdio: ["ignore", "pipe", "inherit"] });
+  const exit = once(child, "exit");
+  const prematureExit = exit.then(([code, signal]) => assert.fail(`Lock owner exited before contention check finished (code: ${code}, signal: ${signal})`));
   try {
-    const [ready] = await Promise.race([once(child.stdout, "data"), exit.then(() => assert.fail("Lock owner exited before acquisition"))]);
+    const [ready] = await Promise.race([once(child.stdout, "data"), prematureExit]);
     assert.equal(ready.toString(), "ready");
-    await assert.rejects(withFileLock(path, async () => assert.fail("Contended lock admitted a waiter"), AbortSignal.timeout(100)), { name: "TimeoutError" });
+    await Promise.race([
+      assert.rejects(withFileLock(path, async () => {
+        assert.equal(child.exitCode, null, "Lock owner exited before waiter entered");
+        assert.equal(child.signalCode, null, "Lock owner was killed before waiter entered");
+        assert.fail("Contended lock admitted a waiter while the owner was alive");
+      }, AbortSignal.timeout(100)), { name: "TimeoutError" }),
+      prematureExit,
+    ]);
     child.kill("SIGKILL");
     await exit;
     assert.equal(await withFileLock(path, async () => "reacquired", AbortSignal.timeout(5000)), "reacquired");
