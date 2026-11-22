@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="282" viewBox="0 0 820 282" role="img" aria-labelledby="title description">
+  <title id="title">Example search</title>
+  <desc id="description">An OAuth token expiry query finds two results: result 1 by semantic similarity and result 2 by shared terms. Result 1 links to another memory.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0L8 4L0 8Z" fill="#718198"/>
+    </marker>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="819" height="281" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+  <g fill="#fff" stroke="#8c9bad">
+    <rect x="18" y="93" width="152" height="96" rx="8"/>
+    <rect x="328" y="24" width="174" height="96" rx="8"/>
+    <rect x="328" y="162" width="174" height="96" rx="8"/>
+    <rect x="632" y="24" width="170" height="96" rx="8"/>
+  </g>
+  <g fill="none" stroke="#718198" stroke-width="1.5" marker-end="url(#arrow)">
+    <path d="M170 141H189V72H321"/>
+    <path d="M170 141H189V210H321"/>
+    <path d="M502 72H625" stroke-dasharray="5 4"/>
+  </g>
+
+  <g fill="#1f2328" font-family="Arial, Liberation Sans, sans-serif" font-size="14" text-anchor="middle">
+    <text x="94" y="116"><tspan font-weight="600">Search</tspan><tspan x="94" dy="21">What happens</tspan><tspan x="94" dy="18">when an OAuth</tspan><tspan x="94" dy="18">token expires?</tspan></text>
+    <text x="415" y="47"><tspan font-weight="600">Result 1 · weight 3</tspan><tspan x="415" dy="21">Refresh the access</tspan><tspan x="415" dy="18">token before its TTL</tspan><tspan x="415" dy="18">runs out.</tspan></text>
+    <text x="415" y="185"><tspan font-weight="600">Result 2 · weight 1</tspan><tspan x="415" dy="21">If OAuth refresh</tspan><tspan x="415" dy="18">fails, ask the user</tspan><tspan x="415" dy="18">to sign in again.</tspan></text>
+    <text x="717" y="47"><tspan font-weight="600">Linked memory</tspan><tspan x="717" dy="18" font-weight="600">Weight 2</tspan><tspan x="717" dy="20">Encrypt the stored</tspan><tspan x="717" dy="15">refresh token with</tspan><tspan x="717" dy="15">the OS keychain.</tspan></text>
+  </g>
+  <g fill="#424c5a" font-family="Arial, Liberation Sans, sans-serif" font-size="12" text-anchor="middle">
+    <text x="254" y="45">Similar meaning<tspan x="254" dy="15">via embeddings</tspan></text>
+    <text x="254" y="183">Shared terms:<tspan x="254" dy="15">OAuth, token</tspan></text>
+    <text x="563" y="45">Follow<tspan x="563" dy="15">stored link</tspan></text>
+  </g>
+</svg>

@@ -92,15 +92,15 @@ Then run `/psm-setup` and choose a GPU embedding model. If you've already set up
 | --- | --- |
 | 🧠 **Persistent memory** | Keep guidelines, preferences, and lessons across sessions. Save them for one project or make them available across projects. |
 | 🔎 **Hybrid search** | Find memories by exact terms or by meaning, even when you don't remember the original wording. |
-| 🎯 **Context-aware recall** | Automatically brings relevant memories into the current conversation without loading everything you've saved. Use `/psm-inject` to bring in relevant context on demand. |
+| 🎯 **Auto recall** | Automatically brings relevant memories into the current conversation without loading everything you've saved. Use `/psm-inject` to bring in relevant context on demand. |
 | 🔗 **Memory links** | Connect notes that are useful together, even when they aren't similar enough to show up in the same search. |
 | 💬 **Session search** | Find details in past Pi conversations that were never saved as memories. |
-| ⚡ **Background review** | Decides what's worth remembering, whether to add a new memory, update or reinforce an existing one, or skip it. For new memories, it chooses the kind and whether they belong to the project or should be available globally. |
-| ⚙️ **Configurable reviews** | Choose which model reviews your conversations, how often it runs, and what instructions it follows when deciding what to save. |
-| ⚖️ **Weighted memories** | Reinforce an existing memory when a fresh correction or verified recurrence confirms it, instead of saving another copy. |
+| ⚡ **Auto review** | Decides what's worth remembering, whether to add a new memory, update or reinforce an existing one, or skip it. For new memories, it chooses the kind and whether they belong to the project or should be available globally. |
+| ⚙️ **Review setup** | Choose which model reviews your conversations, how often it runs, and what instructions it follows when deciding what to save. |
+| ⚖️ **Weights** | Reinforce an existing memory when a fresh correction or verified recurrence confirms it, instead of saving another copy. |
 | 🧹 **Consolidation** | Merge overlapping memories so the same advice doesn't live in several places. |
 | 🧩 **Conflict cleanup** | Find and clean up contradictions between memories or with standing instructions. |
-| 🧭 **Memory respects your instructions** | Saved memories provide context, not authority. Your current request and applicable project instructions take precedence. |
+| 🧭 **Priority rules** | Saved memories provide context, not authority. Your current request and applicable project instructions take precedence. |
 | 📌 **Pins** | Keep standing instructions available without relying on search to find them. |
 | 📚 **Reusable skills** | Pi can decide on its own to save a useful procedure as a skill so it can reuse what worked next time. |
 
@@ -126,17 +126,7 @@ In `/psm-settings` → **Trigger phrases**, you can also add correction phrases 
 
 #### Example search
 
-```mermaid
-flowchart LR
-    Q["Search: What happens when an OAuth token expires?"]
-    A["Result 1 · weight 3<br/>Refresh the access token before its TTL runs out."]
-    B["Result 2 · weight 1<br/>If OAuth refresh fails, ask the user to sign in again."]
-    C["Linked memory · weight 2<br/>Encrypt the stored refresh token with the OS keychain."]
-
-    Q -->|"Similar meaning via embeddings"| A
-    Q -->|"Shared terms: OAuth, token"| B
-    A -.->|"Follow stored link"| C
-```
+![An OAuth token expiry search finds two results: one by similar meaning and one by shared terms. The first result links to a memory about storing the refresh token in the OS keychain.](./example-search.svg)
 
 Search returns results 1 and 2. If Pi follows the stored link from result 1, it also finds the note about encrypting the refresh token.
 
