@@ -1,6 +1,6 @@
 {
   "name": "pi-smart-mem",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Persistent project and global memory for Pi with local embeddings",
   "keywords": [
     "pi-package",
