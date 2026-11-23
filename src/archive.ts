@@ -112,6 +112,14 @@ export class Archive {
     });
   }
 
+  async removeSkill(id: string, signal?: AbortSignal): Promise<boolean> {
+    return withDatabase(this.#path, false, async (db) => {
+      signal?.throwIfAborted();
+      const [rows] = await db.query<[SkillRow[]]>(`DELETE $id WHERE ${inScope} RETURN BEFORE`, { project: this.#project, id: new RecordId("smart_skill", id) });
+      return rows.length > 0;
+    });
+  }
+
   async index(path: string, entries: FileEntry[]) {
     const header = entries.find((entry) => entry.type === "session");
     if (!header) throw new Error(`Not a Pi transcript: ${path}`);

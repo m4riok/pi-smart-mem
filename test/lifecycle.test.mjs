@@ -84,7 +84,7 @@ async function fixture(t, { child = false, setup = false, empty = false, hermes 
   await resourceLoader.reload();
   const sessionManager = SessionManager.create(cwd, join(agentDir, "sessions", "fixture"));
   const { session } = await createAgentSession({ cwd, agentDir, settingsManager, resourceLoader, modelRuntime, model: faux.getModel(), sessionManager,
-    tools: child ? ["psm_memory_read", "psm_skill_save"] : undefined, noTools: child ? undefined : "builtin" });
+    tools: child ? ["psm_memory_read", "psm_skill_save", "psm_skill_remove"] : undefined, noTools: child ? undefined : "builtin" });
   boundSession = session;
   const dialogs = [];
   const ui = { notify: (...args) => alerts.push(args), setWidget,
@@ -499,6 +499,7 @@ test("Pi runs user-triggered and periodic reviews and adds independent, repeatab
       const names = getCurrentTools(ctx.messages).map((tool) => tool.name);
       assert.ok(names.includes("psm_memory_remove"));
       assert.ok(!names.includes("psm_skill_save"));
+      assert.ok(!names.includes("psm_skill_remove"));
       return fauxAssistantMessage(fauxToolCall("psm_memory_remove", { id: removable.id }));
     },
     fauxAssistantMessage("Removed obsolete fixture memory"),
@@ -512,8 +513,8 @@ test("Pi runs user-triggered and periodic reviews and adds independent, repeatab
   await session.prompt("No, use pnpm for this task.");
   await waitForReviews(sessionManager, 1);
   const file = new SettingsFile(directory);
-  // A pre-prefix review allowlist still permits removal, but never skill saves.
-  await file.update({ reviewTools: [...(await file.read()).reviewTools, "skill_save", "memory_remove"] });
+  // A pre-prefix review allowlist still permits memory removal, but not skill writes.
+  await file.update({ reviewTools: [...(await file.read()).reviewTools, "skill_save", "psm_skill_remove", "memory_remove"] });
   await session.prompt("Remember this: use fixtures for regression checks.");
   await waitForReviews(sessionManager, 3);
   assert.deepEqual(seen, ["correction", "initial", "explicit", "periodic"]);
@@ -875,9 +876,10 @@ for (const reason of ["quit", "reload"]) test(`${reason} cancels review and disc
 
 test("interactive Memory panel separates scoped counts and refreshes after writes", async (t) => {
   let panel;
-  const { session, note, faux, errors } = await fixture(t, { mode: "tui", setWidget: (key, build) => {
+  const { session, note, faux, errors, archive, directory, cwd } = await fixture(t, { mode: "tui", setWidget: (key, build) => {
     if (key === "smart-mem") panel = build?.({ requestRender() {} }, { fg: (_color, text) => text });
   } });
+  await new SettingsFile(directory).update({ initialMessages: 100, periodicTurns: 100 });
   const counts = (width = 100) => panel.render(width).slice(1).join("\n");
   assert.equal(panel.render(100)[0], "🧠 ━━━━  Active");
   assert.match(counts(), /Project: 0 mem · 0 skills · 0 pins  │  Global: 1 mem · 0 skills · 1 pins/);
@@ -890,6 +892,28 @@ test("interactive Memory panel separates scoped counts and refreshes after write
   ]);
   await session.prompt("Update the stored fixtures");
   assert.match(counts(), /Project: 0 mem · 1 skills · 1 pins  │  Global: 0 mem · 0 skills · 1 pins/);
+
+  const project = (await readFile(join(cwd, ".pi", "smart-mem-id"), "utf8")).trim();
+  const path = join(directory, "db");
+  const localArchive = new Archive(path, project);
+  const otherArchive = new Archive(path, "other-project");
+  const [local] = await localArchive.searchSkills("Verify fixtures");
+  const draft = { name: "Delete fixture", description: "Test skill removal", text: "Run tests" };
+  const global = await archive.saveSkill({ ...draft, scope: "global" });
+  const other = await otherArchive.saveSkill({ ...draft, scope: "project" });
+  faux.appendResponses([
+    ...[other, local, global, local].map(({ id }) => fauxAssistantMessage(fauxToolCall("psm_skill_remove", { id }))),
+    fauxAssistantMessage("Finished removing fixture skills"),
+  ]);
+  await session.prompt("Delete the selected fixture skills.");
+  const removals = session.sessionManager.getBranch().flatMap((entry) =>
+    entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "psm_skill_remove"
+      ? [JSON.parse(contentText(entry.message.content)).result.removed] : []);
+  assert.deepEqual(removals, [false, true, true, false]);
+  assert.equal(await localArchive.readSkill(local.id), undefined);
+  assert.equal(await archive.readSkill(global.id), undefined);
+  assert.deepEqual(await otherArchive.readSkill(other.id), other);
+  assert.match(counts(), /Project: 0 mem · 0 skills · 1 pins  │  Global: 0 mem · 0 skills · 1 pins/);
   assert.deepEqual(errors, []);
 });
 

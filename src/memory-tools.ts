@@ -29,6 +29,7 @@ export const toolNames = {
   skillSearch: `${prefix}skill_search`,
   skillRead: `${prefix}skill_read`,
   skillSave: `${prefix}skill_save`,
+  skillRemove: `${prefix}skill_remove`,
   sessionSearch: `${prefix}session_search`,
   databaseQuery: `${prefix}db_query`,
   selectMemories: `${prefix}select_memories`,
@@ -79,6 +80,10 @@ export function memoryTools(getStore: () => MemoryStore, getArchive: () => Archi
     operation(toolNames.skillSave, `Save a genuinely repeatable procedure. Check for existing skills with ${toolNames.skillSearch} first; pass a same-scope skill's ID to improve it instead of creating a duplicate.`, Type.Object({ id: Type.Optional(id), name: text, description: text, text, scope }), async ({ id, ...draft }, signal) => {
       const value = await getArchive().saveSkill(draft, id, signal);
       return { value, saved: !!value };
+    }),
+    operation(toolNames.skillRemove, "Remove one saved skill by ID from the current project or global scope.", Type.Object({ id }), async ({ id }, signal) => {
+      const removed = await getArchive().removeSkill(id, signal);
+      return { value: { removed }, saved: removed };
     }),
   ];
 }

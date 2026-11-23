@@ -203,7 +203,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
   }
   const sessionSearch = sessionSearchTool(getArchive, () => activeContext?.sessionManager.getSessionFile());
   const tools = [...memoryTools(getStore, getArchive, embed), sessionSearch];
-  const reviewTools = tools.filter(({ name }) => name !== toolNames.skillSave);
+  const reviewTools = tools.filter(({ name }) => name !== toolNames.skillSave && name !== toolNames.skillRemove);
   registerTools(pi, main ? tools : reviewTools);
 
   async function bindProject(ctx: ExtensionContext) {
@@ -493,7 +493,7 @@ export default function smartMemory(pi: ExtensionAPI): void {
       if (debugDatabaseQueries) void log.debug("database.query.request", { ...fields, query: event.args?.query });
     } else if (hasPanel(ctx)) toolActivity.set(event.toolCallId, panel.begin(event.toolName));
   });
-  const inventoryTools = new Set([toolNames.memoryAdd, toolNames.memoryRemove, toolNames.skillSave]);
+  const inventoryTools = new Set([toolNames.memoryAdd, toolNames.memoryRemove, toolNames.skillSave, toolNames.skillRemove]);
   pi.on("tool_execution_end", async (event, ctx) => {
     const database = isDatabaseTool(event.toolName);
     if (lockProblem || (!database && !exposedNames.has(event.toolName))) return;
