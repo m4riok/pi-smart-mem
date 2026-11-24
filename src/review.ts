@@ -52,6 +52,8 @@ export function runnerContext(messages: Message[], systemPrompt: string): Messag
   });
 }
 
+const taskRequest = "Carry out the smart-mem task described in the system prompt.";
+
 export type ModelContext = Pick<ExtensionContext, "model" | "modelRegistry" | "thinkingLevel" | "getSystemPrompt">;
 
 export async function runModel(ctx: ModelContext, messages: Message[], task: string, tools: Operation[], options: {
@@ -69,6 +71,10 @@ export async function runModel(ctx: ModelContext, messages: Message[], task: str
   const leading = source[0];
   if (leading.role !== "system") throw new Error("Pi context has no leading system prompt");
   const context: Message[] = [{ ...leading, sections: { ...leading.sections, "smart-mem-task": `\n\n${task}` }, toolsAdded: definitions }, ...source.slice(1)];
+  // A transcript captured at turn end usually ends with the assistant's reply. Many
+  // models reject a request that ends with an assistant message (prefill), so ask
+  // for the task in a user turn. Transcripts ending in a tool result are already valid.
+  if (context.filter(({ role }) => role !== "system").at(-1)?.role === "assistant") context.push({ role: "user", content: taskRequest, timestamp: Date.now() });
   for (let iteration = 0; iteration < 16; iteration++) {
     signal?.throwIfAborted();
     const response = await ctx.modelRegistry.streamSimple(model, { messages: context }, { signal, reasoning: reasoning === "off" ? undefined : reasoning }).result();

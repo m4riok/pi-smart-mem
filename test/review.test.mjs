@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { detectTrigger, injectionText } from "../src/review.ts";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { detectTrigger, injectionText, runModel } from "../src/review.ts";
 
 const defaults = { include: [], exclude: [] };
 
@@ -40,4 +41,33 @@ test("injection takes longest whole-note prefix measured in UTF-8 bytes", () => 
   assert.deepEqual(injectionText([full, "a"]), { kept: [full], overflow: true });
   assert.deepEqual(injectionText([full + "!", "fits"]), { kept: [], overflow: true });
   assert.deepEqual(injectionText(["abc", "é", "x"], 7), { kept: ["abc", "é"], overflow: true });
+});
+
+test("model runs end with a user turn when the transcript ends with an assistant reply", async () => {
+  const sent = [];
+  const ctx = { model: { id: "fixture", reasoning: false }, thinkingLevel: "off", getSystemPrompt: () => "Base prompt", modelRegistry: {
+    streamSimple(_model, { messages }) {
+      sent.push([...messages]);
+      return { result: async () => fauxAssistantMessage("Done") };
+    },
+  } };
+  const user = { role: "user", content: "Question", timestamp: 1 };
+  const reply = fauxAssistantMessage("Answer");
+  const leading = { role: "system", content: "Base prompt", timestamp: 0 };
+  const update = { role: "system", content: "Later instruction", timestamp: 3 };
+  const run = (messages) => runModel(ctx, messages, "Task", [], { settings: defaults });
+  const roles = () => sent.at(-1).map(({ role }) => role);
+
+  await run([user, reply]);
+  assert.deepEqual(roles(), ["system", "user", "assistant", "user"]);
+  assert.match(sent.at(-1).at(-1).content, /task/i);
+  await run([leading, user, reply, update]);
+  assert.deepEqual(roles(), ["system", "user", "assistant", "system", "user"]);
+  const toolResult = { role: "toolResult", toolCallId: "call", toolName: "lookup", content: [{ type: "text", text: "{}" }], isError: false, timestamp: 4 };
+  const call = fauxAssistantMessage(fauxToolCall("lookup", {}, { id: "call" }), { stopReason: "toolUse" });
+  await run([user, call, toolResult]);
+  assert.deepEqual(roles(), ["system", "user", "assistant", "toolResult"]);
+  await run([user]);
+  assert.deepEqual(roles(), ["system", "user"]);
+  assert.deepEqual(sent.at(-1)[1], user);
 });
